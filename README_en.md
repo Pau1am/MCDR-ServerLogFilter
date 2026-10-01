@@ -1,5 +1,7 @@
 # MCDR-ServerLogFilter
 
+**Language / 语言:** **English** | [简体中文](README.md)
+
 An MCDReforged plugin that **hides noisy server console lines from the MCDR console while leaving the server's own log file completely untouched.**
 
 [![MCDR](https://img.shields.io/badge/MCDReforged-%3E%3D2.13-blue)](https://mcdreforged.com/)

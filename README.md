@@ -1,5 +1,7 @@
 # MCDR-ServerLogFilter
 
+**语言 / Language:** **简体中文** | [English](README_en.md)
+
 一个 MCDReforged 插件：**把服务端的刷屏日志从 MCDR 控制台隐去，同时完整保留服务端自己的日志文件。**
 
 [![MCDR](https://img.shields.io/badge/MCDReforged-%3E%3D2.13-blue)](https://mcdreforged.com/)
