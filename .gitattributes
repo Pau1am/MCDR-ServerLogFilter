@@ -1,0 +1,7 @@
+# 统一使用 LF 换行，避免 Windows / macOS / Linux 之间出现换行符差异
+* text=auto eol=lf
+
+# 发布产物按二进制处理
+*.mcdr binary
+*.jar binary
+*.png binary
