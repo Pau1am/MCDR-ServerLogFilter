@@ -143,7 +143,7 @@ MCDR 会把服务端打印的每一行原样回显到控制台。绝大多数情
 插件日志：
 
 ```
-插件 server_log_filter@1.0.0 已加载
+插件 server_log_filter@1.0.1 已加载
 已启用 1 条日志过滤规则；命中后仅从 MCDR 控制台隐去，服务端日志不受影响
 本次运行共从 MCDR 控制台隐去 3 行服务端日志（服务端日志文件不受影响）
 ```
@@ -171,7 +171,7 @@ import zipfile
 from pathlib import Path
 
 src = Path(".").resolve()
-out = Path("ServerLogFilter-v1.0.0.mcdr")
+out = Path("ServerLogFilter-v1.0.1.mcdr")
 skip = {".git", "__pycache__"}
 
 files = [

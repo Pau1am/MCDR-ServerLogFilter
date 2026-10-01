@@ -1,12 +1,21 @@
 {
   "id": "server_log_filter",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "name": "Server Log Filter",
   "description": {
     "en_us": "Hide noisy server console lines from the MCDR console with configurable regex rules, without touching the server's own log file.",
     "zh_cn": "用可配置的正则规则，把服务端的刷屏日志从 MCDR 控制台隐去，同时不影响服务端自身的日志文件。"
   },
-  "author": "Pau1am",
+  "authors": [
+    {
+      "name": "Pau1am",
+      "link": "https://github.com/Pau1am"
+    }
+  ],
+  "links": {
+    "homepage": "https://github.com/Pau1am/MCDR-ServerLogFilter"
+  },
+  "license": "MIT",
   "dependencies": {
     "mcdreforged": ">=2.13.0"
   }

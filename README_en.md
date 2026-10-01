@@ -143,7 +143,7 @@ Observed console echo:
 Plugin log:
 
 ```
-Plugin server_log_filter@1.0.0 loaded
+Plugin server_log_filter@1.0.1 loaded
 Enabled 1 log filter rule; matches are hidden from the MCDR console only, the server log is unaffected
 Hidden 3 server log lines from the MCDR console this run (server log file unaffected)
 ```
@@ -171,7 +171,7 @@ import zipfile
 from pathlib import Path
 
 src = Path(".").resolve()
-out = Path("ServerLogFilter-v1.0.0.mcdr")
+out = Path("ServerLogFilter-v1.0.1.mcdr")
 skip = {".git", "__pycache__"}
 
 files = [
