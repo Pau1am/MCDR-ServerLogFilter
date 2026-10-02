@@ -120,9 +120,10 @@ MCDR 会把服务端打印的每一行原样回显到控制台。绝大多数情
 ### 单元测试（过滤逻辑、边界与安全属性）
 
 - 目标刷屏行被隐去，且保留 `process`（关键安全属性）
-- **11 类绝不能误伤的行逐一验证不受影响**：启动完成 `Done (...)!`、玩家进出、`Stopping the server`、
-  `moved too quickly`、`moved wrongly`、`Rejecting UseItemOnPacket`、`dropping items too fast`、
-  聊天签名问题、`lost connection`、版本启动行
+- **15 类绝不能误伤的行逐一验证不受影响**：启动完成 `Done (...)!`、玩家进出、`Stopping the server` /
+  `Stopping server`、`moved too quickly`、`moved wrongly`、`Rejecting UseItemOnPacket`、
+  `dropping items too fast`、聊天签名问题、`lost connection`、版本启动行、`Preparing level`、
+  死亡消息、`Saving and pausing game...`
 - `content` 为 `""` / `None` / 纯空白时不崩溃
 - 换玩家名同样命中
 - 多规则各自独立计数；`reload` 后计数归零
@@ -151,6 +152,19 @@ MCDR 会把服务端打印的每一行原样回显到控制台。绝大多数情
 ```
 
 全程**无任何报错**。
+
+### 运行测试
+
+上面的行为都有对应的自动化测试（`tests/`，共 54 个用例），可以在真实 MCDR 上复跑：
+
+```bash
+python -m pip install --target .testlibs -r tests/requirements-test.txt
+PYTHONPATH=.testlibs python -m pytest tests -v      # Windows: $env:PYTHONPATH=".testlibs"
+```
+
+测试断言了本插件最关键的安全属性——被隐去的行**保留 `process`、仅摘掉 `echo_to_console`**。
+如果未来 MCDR 改变 `hidden()` 的语义，测试会直接失败，而不是让插件在服务器上静默出问题。
+细则见 [tests/README.md](tests/README.md)。
 
 ## 自行打包
 

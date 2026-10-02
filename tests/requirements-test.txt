@@ -1,0 +1,5 @@
+# Test-only dependencies. Install into a local directory (no venv needed):
+#   python -m pip install --target .testlibs -r tests/requirements-test.txt
+# Pinned to the versions the suite is verified against.
+mcdreforged==2.16.0
+pytest==9.1.1

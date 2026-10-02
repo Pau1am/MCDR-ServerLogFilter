@@ -120,9 +120,11 @@ A malformed regex will not crash the plugin — the rule is skipped with a warni
 ### Unit tests (filtering logic, edge cases, safety properties)
 
 - The target spam line is hidden while `process` is preserved (the key safety property)
-- **11 classes of must-not-touch lines verified individually**: `Done (...)!`, player join/leave,
-  `Stopping the server`, `moved too quickly`, `moved wrongly`, `Rejecting UseItemOnPacket`,
-  `dropping items too fast`, chat signature warnings, `lost connection`, the version banner
+- **15 classes of must-not-touch lines verified individually**: `Done (...)!`, player join/leave,
+  `Stopping the server` / `Stopping server`, `moved too quickly`, `moved wrongly`,
+  `Rejecting UseItemOnPacket`, `dropping items too fast`, chat signature warnings,
+  `lost connection`, the version banner, `Preparing level`, death messages,
+  `Saving and pausing game...`
 - No crash on `""` / `None` / whitespace-only `content`
 - Matches regardless of player name
 - Multiple rules keep independent counts; `reload` resets counters
@@ -151,6 +153,20 @@ Hidden 3 server log lines from the MCDR console this run (server log file unaffe
 ```
 
 **No errors at all.**
+
+### Running the tests
+
+The behaviour above is covered by an automated suite (`tests/`, 54 cases) that runs against a real MCDR:
+
+```bash
+python -m pip install --target .testlibs -r tests/requirements-test.txt
+PYTHONPATH=.testlibs python -m pytest tests -v      # Windows: $env:PYTHONPATH=".testlibs"
+```
+
+The suite asserts the plugin's key safety property: a hidden line **keeps `process` and only
+loses `echo_to_console`**. If a future MCDR release changes the semantics of `hidden()`, the
+tests fail loudly instead of letting the plugin misbehave silently on your server.
+See [tests/README.md](tests/README.md) for details.
 
 ## Building from source
 
