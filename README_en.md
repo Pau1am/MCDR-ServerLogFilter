@@ -120,9 +120,11 @@ A malformed regex will not crash the plugin — the rule is skipped with a warni
 ### Unit tests (filtering logic, edge cases, safety properties)
 
 - The target spam line is hidden while `process` is preserved (the key safety property)
-- **11 classes of must-not-touch lines verified individually**: `Done (...)!`, player join/leave,
-  `Stopping the server`, `moved too quickly`, `moved wrongly`, `Rejecting UseItemOnPacket`,
-  `dropping items too fast`, chat signature warnings, `lost connection`, the version banner
+- **15 classes of must-not-touch lines verified individually**: `Done (...)!`, player join/leave,
+  `Stopping the server` / `Stopping server`, `moved too quickly`, `moved wrongly`,
+  `Rejecting UseItemOnPacket`, `dropping items too fast`, chat signature warnings,
+  `lost connection`, the version banner, `Preparing level`, death messages,
+  `Saving and pausing game...`
 - No crash on `""` / `None` / whitespace-only `content`
 - Matches regardless of player name
 - Multiple rules keep independent counts; `reload` resets counters
@@ -140,7 +142,7 @@ Observed console echo:
 | `Steve joined the game` | ✅ kept |
 | Any ordinary log line | ✅ kept |
 | `Done (0.648s)! For help, type "help"` | ✅ kept (MCDR startup detection fine) |
-| `Stopping the server` | ✅ kept (MCDR stop detection fine) |
+| `Stopping server` | ✅ kept (MCDR stop detection fine) |
 
 Plugin log:
 
@@ -152,6 +154,24 @@ Hidden 3 server log lines from the MCDR console this run (server log file unaffe
 
 **No errors at all.**
 
+### Running the tests
+
+The behaviour above is covered by an automated suite (`tests/`, 64 cases) that runs against a real
+MCDR — **including the end-to-end group below**, which boots an actual MCDR instance, loads the
+`.mcdr` produced by `pack.py`, and drives a fake server through a full lifecycle:
+
+```bash
+python -m pip install --target .testlibs -r tests/requirements-test.txt
+PYTHONPATH=.testlibs python -m pytest tests -v      # Windows: $env:PYTHONPATH=".testlibs"
+```
+
+The suite asserts the plugin's key safety property: a hidden line **keeps `process` and only
+loses `echo_to_console`** — and that it **really is absent from the console**, since the end-to-end
+cases inspect MCDR's actual console output. If a future MCDR release changes the semantics of
+`hidden()`, the tests fail loudly instead of letting the plugin misbehave silently on your server.
+The end-to-end cases take ~25 s; skip them with `MCDR_SKIP_E2E=1`.
+See [tests/README.md](tests/README.md) for details.
+
 ## Building from source
 
 The repository follows MCDR's standard layout — root metadata plus a same-named code package:
@@ -162,30 +182,33 @@ MCDR-ServerLogFilter/
 ├── LICENSE
 ├── README.md
 ├── README_en.md
+├── CHANGELOG.md
+├── pack.py
 └── server_log_filter/
     └── __init__.py
 ```
 
-Build (make sure to exclude `__pycache__` and `.pyc`):
+Build with the included, allowlist-based packer:
 
-```python
-import zipfile
-from pathlib import Path
-
-src = Path(".").resolve()
-out = Path("ServerLogFilter-v1.0.1.mcdr")
-skip = {".git", "__pycache__"}
-
-files = [
-    p for p in src.rglob("*")
-    if p.is_file()
-    and not (skip & set(p.parts))
-    and p.suffix != ".pyc"
-]
-with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
-    for p in files:
-        z.write(p, p.relative_to(src).as_posix())
+```bash
+python pack.py            # -> ServerLogFilter-v<version>.mcdr
 ```
+
+> **Why an allowlist and not a skip list?** An earlier version of this section used
+> `rglob("*")` with a short `skip` set, which is a *denylist*: any new file in the repo
+> silently ends up in the release artifact. Two concrete consequences:
+>
+> 1. **The artifact would fail to load at all.** MCDR validates the root entries of a
+>    `.mcdr` (`PackedPlugin._check_dir_legality`) and raises
+>    `IllegalPluginStructure: Packed plugin cannot contain other module` for a root-level
+>    `conftest.py` or `setup.py`. The test suite's `conftest.py` sits exactly there, so the
+>    denylist approach ships a plugin that cannot be loaded.
+> 2. **Runaway size.** After installing `.testlibs/` per `tests/README.md`, the denylist
+>    bundled all of MCDR and its dependencies: measured at **1362 files / 7.11 MB**
+>    (allowlist: 6 files / ~17 KiB).
+>
+> `test_packaged_artifact_is_loadable` in `tests/test_plugin.py` runs `pack.py` and checks
+> the result with MCDR's own validation, so this class of regression cannot come back.
 
 ## Requirements
 

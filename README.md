@@ -120,9 +120,10 @@ MCDR 会把服务端打印的每一行原样回显到控制台。绝大多数情
 ### 单元测试（过滤逻辑、边界与安全属性）
 
 - 目标刷屏行被隐去，且保留 `process`（关键安全属性）
-- **11 类绝不能误伤的行逐一验证不受影响**：启动完成 `Done (...)!`、玩家进出、`Stopping the server`、
-  `moved too quickly`、`moved wrongly`、`Rejecting UseItemOnPacket`、`dropping items too fast`、
-  聊天签名问题、`lost connection`、版本启动行
+- **15 类绝不能误伤的行逐一验证不受影响**：启动完成 `Done (...)!`、玩家进出、`Stopping the server` /
+  `Stopping server`、`moved too quickly`、`moved wrongly`、`Rejecting UseItemOnPacket`、
+  `dropping items too fast`、聊天签名问题、`lost connection`、版本启动行、`Preparing level`、
+  死亡消息、`Saving and pausing game...`
 - `content` 为 `""` / `None` / 纯空白时不崩溃
 - 换玩家名同样命中
 - 多规则各自独立计数；`reload` 后计数归零
@@ -140,7 +141,7 @@ MCDR 会把服务端打印的每一行原样回显到控制台。绝大多数情
 | `Steve joined the game` | ✅ 保留 |
 | 任意普通日志行 | ✅ 保留 |
 | `Done (0.648s)! For help, type "help"` | ✅ 保留（MCDR 启动检测正常） |
-| `Stopping the server` | ✅ 保留（MCDR 停止检测正常） |
+| `Stopping server` | ✅ 保留（MCDR 停止检测正常） |
 
 插件日志：
 
@@ -152,9 +153,25 @@ MCDR 会把服务端打印的每一行原样回显到控制台。绝大多数情
 
 全程**无任何报错**。
 
+### 运行测试
+
+上面的行为都有对应的自动化测试（`tests/`，共 64 个用例），可以在真实 MCDR 上复跑——**包括本节
+「端到端」这一组**，它会启动一个真正的 MCDR 实例、加载 `pack.py` 产出的 `.mcdr`、并用假服务端
+跑完整个生命周期：
+
+```bash
+python -m pip install --target .testlibs -r tests/requirements-test.txt
+PYTHONPATH=.testlibs python -m pytest tests -v      # Windows: $env:PYTHONPATH=".testlibs"
+```
+
+测试断言了本插件最关键的安全属性——被隐去的行**保留 `process`、仅摘掉 `echo_to_console`**，
+并且**真的没有出现在控制台上**（端到端用例直接检查 MCDR 的控制台输出）。
+如果未来 MCDR 改变 `hidden()` 的语义，测试会直接失败，而不是让插件在服务器上静默出问题。
+端到端用例约需 25 秒，可用 `MCDR_SKIP_E2E=1` 跳过。细则见 [tests/README.md](tests/README.md)。
+
 ## 自行打包
 
-仓库结构为 MCDR 标准的「根元数据 + 同名代码子包」：
+本插件是 MCDR 标准的「根元数据 + 同名代码子包」：
 
 ```
 MCDR-ServerLogFilter/
@@ -162,30 +179,31 @@ MCDR-ServerLogFilter/
 ├── LICENSE
 ├── README.md
 ├── README_en.md
+├── CHANGELOG.md
 └── server_log_filter/
     └── __init__.py
 ```
 
-打包（务必排除 `__pycache__` 与 `.pyc`）：
+打包时**只准放行上面这些文件**，用「白名单」而不是「黑名单」。仓库里已经附带了这个打包脚本：
 
-```python
-import zipfile
-from pathlib import Path
-
-src = Path(".").resolve()
-out = Path("ServerLogFilter-v1.0.1.mcdr")
-skip = {".git", "__pycache__"}
-
-files = [
-    p for p in src.rglob("*")
-    if p.is_file()
-    and not (skip & set(p.parts))
-    and p.suffix != ".pyc"
-]
-with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
-    for p in files:
-        z.write(p, p.relative_to(src).as_posix())
+```bash
+python pack.py            # 生成 ServerLogFilter-v<版本号>.mcdr
 ```
+
+> **为什么必须用白名单？** 早期版本的这一节用的是 `rglob("*")` 加一个很短的 `skip` 列表，
+> 那是**黑名单**思路，会被仓库里任何新文件悄悄带进发布包。两个具体后果：
+>
+> 1. **发布包直接加载失败。** MCDR 会校验 `.mcdr` 根级条目（`PackedPlugin._check_dir_legality`），
+>    根目录出现 `conftest.py`、`setup.py` 这类模块就抛
+>    `IllegalPluginStructure: Packed plugin cannot contain other module`。测试用的
+>    `conftest.py` 恰好就在根目录，所以黑名单方案会让插件**完全无法加载**。
+> 2. **体积失控。** 按 `tests/README.md` 装了 `.testlibs/` 之后，黑名单会把整个 MCDR
+>    及其依赖一起打进包里：实测 **1362 个文件、7.11 MB**（白名单为 6 个文件、约 17 KiB）。
+>
+> `tests/test_plugin.py` 里的 `test_packaged_artifact_is_loadable` 会跑一遍 `pack.py`，
+> 并用 MCDR 自己的校验逻辑检查产物，所以这类回归不会再溜过去。
+>
+> `pack.py` 本身不进包，原因和 `conftest.py` 相同——根级模块会让 MCDR 拒绝加载。
 
 ## 环境要求
 

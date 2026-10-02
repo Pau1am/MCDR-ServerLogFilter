@@ -5,6 +5,9 @@ __pycache__/
 .venv/
 venv/
 
+# 测试依赖（见 tests/README.md）
+.testlibs/
+
 # 构建产物（.mcdr 请通过 Releases 分发）
 *.mcdr
 Releases/
