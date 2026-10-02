@@ -4,7 +4,7 @@
 
 An MCDReforged plugin that **hides noisy server console lines from the MCDR console while leaving the server's own log file completely untouched.**
 
-[![MCDR](https://img.shields.io/badge/MCDReforged-%3E%3D2.13-blue)](https://mcdreforged.com/)
+[![MCDR](https://img.shields.io/badge/MCDReforged-%3E%3D2.15-blue)](https://mcdreforged.com/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Python](https://img.shields.io/badge/python-%3E%3D3.9-blue)](https://www.python.org/)
 
@@ -145,7 +145,7 @@ Observed console echo:
 Plugin log:
 
 ```
-Plugin server_log_filter@1.0.1 loaded
+Plugin server_log_filter@1.0.2 loaded
 Enabled 1 log filter rule; matches are hidden from the MCDR console only, the server log is unaffected
 Hidden 3 server log lines from the MCDR console this run (server log file unaffected)
 ```
@@ -189,8 +189,30 @@ with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
 
 ## Requirements
 
-- MCDReforged **>= 2.13.0** (the `InfoFilter` API has been available since 2.13)
+- MCDReforged **>= 2.15.0**
+
+  > Why not 2.13? The plugin's core design relies on `InfoActionFlag.hidden()`
+  > (strip the console echo only, keep event dispatch), and that class was introduced in
+  > **MCDR 2.15.0**. In 2.14.x and earlier, `InfoFilter` only supports
+  > "return `False` to discard the whole line", which cannot reproduce this plugin's
+  > behaviour, so those versions are not supported.
+  > Installing on an older MCDR never fails silently — MCDR reports
+  > `dependency mcdreforged@x.y.z does not satisfy version requirement >=2.15.0`.
+
 - Python >= 3.9 (bundled with MCDR)
+
+## Compatibility
+
+| Dimension | Support |
+|---|---|
+| MCDR | **>= 2.15.0** (2.15.0 / 2.15.7 / 2.16.0 tested) |
+| Minecraft | **Independent of the MC version.** 1.16.5 / 1.19.4 / 1.20.1 / 1.20.6 / 1.21.8 / 1.21.11 / 26.1 / 26.2 / 26.3 all tested against real servers |
+
+Filtering happens on the MCDR side (matching each line of the server's stdout), so it does
+not change with the MC version. The only version-dependent part is **what the default rule
+targets**: `standing on air - force-sending blocks below` is only produced by **MC 26.3**.
+On earlier versions the plugin still works — the default rule simply never matches anything,
+and you can configure `patterns` to filter whatever noise your version emits.
 
 ## License
 

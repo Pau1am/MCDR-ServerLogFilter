@@ -1,6 +1,6 @@
 {
   "id": "server_log_filter",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "name": "Server Log Filter",
   "description": {
     "en_us": "Hide noisy server console lines from the MCDR console with configurable regex rules, without touching the server's own log file.",
@@ -17,6 +17,6 @@
   },
   "license": "MIT",
   "dependencies": {
-    "mcdreforged": ">=2.13.0"
+    "mcdreforged": ">=2.15.0"
   }
 }

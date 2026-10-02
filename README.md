@@ -4,7 +4,7 @@
 
 一个 MCDReforged 插件：**把服务端的刷屏日志从 MCDR 控制台隐去，同时完整保留服务端自己的日志文件。**
 
-[![MCDR](https://img.shields.io/badge/MCDReforged-%3E%3D2.13-blue)](https://mcdreforged.com/)
+[![MCDR](https://img.shields.io/badge/MCDReforged-%3E%3D2.15-blue)](https://mcdreforged.com/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Python](https://img.shields.io/badge/python-%3E%3D3.9-blue)](https://www.python.org/)
 
@@ -145,7 +145,7 @@ MCDR 会把服务端打印的每一行原样回显到控制台。绝大多数情
 插件日志：
 
 ```
-插件 server_log_filter@1.0.1 已加载
+插件 server_log_filter@1.0.2 已加载
 已启用 1 条日志过滤规则；命中后仅从 MCDR 控制台隐去，服务端日志不受影响
 本次运行共从 MCDR 控制台隐去 3 行服务端日志（服务端日志文件不受影响）
 ```
@@ -189,8 +189,26 @@ with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
 
 ## 环境要求
 
-- MCDReforged **>= 2.13.0**（`InfoFilter` API 自 2.13 起可用）
+- MCDReforged **>= 2.15.0**
+
+  > 为什么不是 2.13？本插件的核心设计依赖 `InfoActionFlag.hidden()`（只摘控制台回显、保留事件分发），
+  > 而这个类是 **MCDR 2.15.0** 才引入的。2.14.x 及更早的 `InfoFilter` 只有「返回 `False` 即丢弃整条」
+  > 的语义，无法等价实现本插件的行为，所以不支持。
+  > 装到旧版本上不会静默出错——MCDR 会直接提示 `依赖项 mcdreforged@x.y.z 不满足版本约束 >=2.15.0`。
+
 - Python >= 3.9（随 MCDR 自带）
+
+## 兼容性
+
+| 维度 | 支持情况 |
+|---|---|
+| MCDR | **>= 2.15.0**（2.15.0 / 2.15.7 / 2.16.0 已实测） |
+| Minecraft | **与 MC 版本无关**。1.16.5 / 1.19.4 / 1.20.1 / 1.20.6 / 1.21.8 / 1.21.11 / 26.1 / 26.2 / 26.3 均已用真实服务端实测通过 |
+
+过滤发生在 MCDR 侧（对服务端 stdout 逐行匹配），因此不随 MC 版本变化。
+需要注意的只是**默认规则的目标日志**：`standing on air - force-sending blocks below`
+仅由 **MC 26.3** 产生，装到更早版本上插件照常工作、只是默认规则不会命中任何内容——
+此时可以按自己的需要配置 `patterns` 过滤别的刷屏日志。
 
 ## 许可证
 

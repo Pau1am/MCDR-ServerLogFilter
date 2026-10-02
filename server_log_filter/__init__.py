@@ -18,6 +18,12 @@ MC-311474 / MC-311727，每人每 10 秒最多一条）。本插件按用户提�
    与本插件无关，**完全不受影响**，原始记录一条不少。
 3. ``filter_server_info`` 运行在 MCDR 的主线程上（不是任务执行器线程），必须足够快。
    因此正则在载入时预编译，匹配时按顺序短路返回；只有命中时才加锁计数。
+
+运行要求
+--------
+MCDR **>= 2.15.0**。``InfoActionFlag``（``hidden()`` / ``discarded()`` 的区分）自 2.15.0
+起才存在；2.14.x 及更早的 ``InfoFilter`` 只有「返回 False 即丢弃整条」的语义，
+无法在保留事件分发的同时只摘掉控制台回显。低版本上插件会打印一条明确的错误并停用。
 """
 
 import re
@@ -27,7 +33,6 @@ from typing import List, Optional, Pattern
 from mcdreforged.api.command import GreedyText, Literal
 from mcdreforged.api.rtext import RColor, RText, RTextList
 from mcdreforged.api.types import (
-    InfoActionFlag,
     InfoFilter,
     PermissionLevel,
     PluginServerInterface,
@@ -36,6 +41,16 @@ from mcdreforged.api.utils import Serializable
 
 
 DEFAULT_PATTERN = r"standing on air - force-sending blocks below"
+
+# InfoActionFlag 是 MCDR 2.15.0 才引入的 API；2.14.x 及更早只有「丢弃整条」的
+# InfoFilter 协议，无法实现本插件「只摘控制台回显、保留事件分发」的核心设计。
+# 这里做容错导入，让低版本 MCDR 得到一句人能看懂的提示，而不是裸 ImportError。
+MIN_MCDR_VERSION = "2.15.0"
+
+try:
+    from mcdreforged.api.types import InfoActionFlag
+except ImportError:  # pragma: no cover - 仅在 MCDR < 2.15.0 上触发
+    InfoActionFlag = None  # type: ignore[assignment]
 
 
 class Config(Serializable):
@@ -171,6 +186,14 @@ def on_load(server: PluginServerInterface, prev_module) -> None:
     global _config, _log_filter, _server
 
     _server = server
+
+    if InfoActionFlag is None:
+        # 低版本 MCDR 上主动给出可读提示，并放弃注册，避免后续每行日志都抛异常。
+        server.logger.error(
+            "Server Log Filter 需要 MCDR >= {}，当前版本不支持 InfoActionFlag，插件已停用。"
+            "请升级 MCDR 后重试。".format(MIN_MCDR_VERSION)
+        )
+        return
     _config = server.load_config_simple(target_class=Config)
     rules = _build_rules(server, _config.patterns)
     _log_filter = ServerLogFilter(rules, server.logger, _config.log_matched_lines)
