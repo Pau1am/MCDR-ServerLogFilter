@@ -15,7 +15,7 @@ the test dependencies are installed.
 Only these are shipped:
 
 * ``mcdreforged.plugin.json`` — package metadata (required)
-* ``server_log_filter/**.py`` — the plugin code
+* ``server_log_filter/**.py`` — the plugin code, recursively (submodules included)
 * ``LICENSE``, ``README.md``, ``README_en.md``, ``CHANGELOG.md`` — documentation
 
 ``pack.py`` itself is intentionally **not** included, for the same root-module reason.
@@ -59,7 +59,10 @@ def collect() -> list:
         rel = path.relative_to(SRC)
         if rel.parent == Path(".") and rel.name in ROOT_FILES:
             files.append(path)
-        elif rel.parent == Path(PACKAGE_NAME) and rel.suffix == ".py":
+        elif rel.parts and rel.parts[0] == PACKAGE_NAME and rel.suffix == ".py":
+            # Recursive: ``rel.parts[0]`` (not ``rel.parent``) so that submodules
+            # such as ``server_log_filter/sub/helper.py`` are shipped too. Using
+            # ``rel.parent`` would silently drop them and produce a broken release.
             files.append(path)
     return sorted(files)
 
