@@ -1,7 +1,8 @@
 # 测试 / Tests
 
-本目录是 Server Log Filter 的测试套件。**58 个用例**，覆盖过滤行为、配置、
-命令面、发布打包，以及本插件最核心的安全属性（被隐去的行仍保留 `process`，事件照常分发）。
+本目录是 Server Log Filter 的测试套件。**64 个用例**，覆盖过滤行为、配置、
+命令面、发布打包、**真实 MCDR 端到端**，以及本插件最核心的安全属性
+（被隐去的行仍保留 `process`，事件照常分发）。
 
 MCDR 是**硬依赖**：插件配置类继承自 `mcdreforged.api.utils.Serializable`，
 没有 MCDR 连 `import server_log_filter` 都会失败。所以下面的步骤是必需的。
@@ -30,7 +31,7 @@ $env:PYTHONPATH=".testlibs"; python -m pytest tests -v
 预期输出结尾：
 
 ```
-58 passed
+64 passed
 ```
 
 ## 覆盖内容
@@ -44,7 +45,36 @@ $env:PYTHONPATH=".testlibs"; python -m pytest tests -v
 | MCDR 契约 | 2 | `InfoActionFlag.hidden()` 的常量构成；`InfoFilter` 允许改写 `action_flag` |
 | 命令面与元数据 | 10 | `on_load` 注册项；状态/测试/重载命令输出；`reload` 的 ADMIN 权限门禁；插件元数据与 `MIN_MCDR_VERSION` 同步 |
 | 发布打包 | 4 | 见下 |
-| **合计** | **58** | |
+| **端到端（真实 MCDR）** | **6** | 见下 |
+| **合计** | **64** | |
+
+## 端到端测试（`tests/test_e2e.py`）
+
+这一层做单测原理上做不到的事：**启动一个真的 MCDR**，加载 `pack.py` 产出的 `.mcdr`
+（不是源码目录），用一个假服务端跑完整生命周期，然后检查 MCDR **真正的控制台输出**。
+
+流程：`Done (...)!` 启动 → 玩家进出 → 两条目标刷屏行 → 若干无害行 → `Stopping server` 退出。
+假服务端以退出码 0 结束，因此 MCDR 能走完正常的停止流程并触发插件的 `on_server_stop`。
+
+| 用例 | 断言 |
+|---|---|
+| `test_target_lines_are_hidden_from_the_console` | 目标行回显次数为 **0** |
+| `test_innocent_lines_still_reach_the_console` | 版本行 / `Preparing level` / 玩家进出 / `moved too quickly` / `lost connection` / `Saving players` 全部保留 |
+| `test_mcdr_startup_and_stop_detection_still_work` | `Done (...)`、`Stopping server`、`Server stopped` 均正常出现（若插件退化成 `discarded()` 就会失败） |
+| `test_plugin_reports_what_it_hid` | 停止时汇总为「隐去 **2** 行」 |
+| `test_packaged_plugin_is_what_was_loaded` | 加载的确实是 `.mcdr`，插件目录里没有源码副本 |
+| `test_plugin_generated_its_default_config` | 首次运行生成 `config/server_log_filter/config.json`，字段与默认值正确 |
+
+**这不是空断言**：把插件从 `plugins/` 拿掉后重跑，目标行回显 2 次，第 1 条用例会失败。
+
+两个让测试跑得快且稳定的细节：
+
+- `handler_detection: false` —— MCDR 的处理器自动探测会先采样**一整分钟**
+  （`HANDLER_DETECTION_MINIMUM_SAMPLING_TIME = 60`）才启动服务端，必须关掉并显式指定 handler。
+- `start_command` 里的解释器路径**要加引号**：路径含空格（如 `Paul LAM`）时，不加引号会被
+  `cmd.exe` 截断成 `'C:\Users\Paul' is not recognized...`。
+
+约需 25 秒；`MCDR_SKIP_E2E=1` 可跳过，缺少 `.testlibs` 时自动 skip。
 
 ## 发布打包的回归防护
 

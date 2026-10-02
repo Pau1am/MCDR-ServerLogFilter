@@ -142,7 +142,7 @@ Observed console echo:
 | `Steve joined the game` | ✅ kept |
 | Any ordinary log line | ✅ kept |
 | `Done (0.648s)! For help, type "help"` | ✅ kept (MCDR startup detection fine) |
-| `Stopping the server` | ✅ kept (MCDR stop detection fine) |
+| `Stopping server` | ✅ kept (MCDR stop detection fine) |
 
 Plugin log:
 
@@ -156,7 +156,9 @@ Hidden 3 server log lines from the MCDR console this run (server log file unaffe
 
 ### Running the tests
 
-The behaviour above is covered by an automated suite (`tests/`, 58 cases) that runs against a real MCDR:
+The behaviour above is covered by an automated suite (`tests/`, 64 cases) that runs against a real
+MCDR — **including the end-to-end group below**, which boots an actual MCDR instance, loads the
+`.mcdr` produced by `pack.py`, and drives a fake server through a full lifecycle:
 
 ```bash
 python -m pip install --target .testlibs -r tests/requirements-test.txt
@@ -164,8 +166,10 @@ PYTHONPATH=.testlibs python -m pytest tests -v      # Windows: $env:PYTHONPATH="
 ```
 
 The suite asserts the plugin's key safety property: a hidden line **keeps `process` and only
-loses `echo_to_console`**. If a future MCDR release changes the semantics of `hidden()`, the
-tests fail loudly instead of letting the plugin misbehave silently on your server.
+loses `echo_to_console`** — and that it **really is absent from the console**, since the end-to-end
+cases inspect MCDR's actual console output. If a future MCDR release changes the semantics of
+`hidden()`, the tests fail loudly instead of letting the plugin misbehave silently on your server.
+The end-to-end cases take ~25 s; skip them with `MCDR_SKIP_E2E=1`.
 See [tests/README.md](tests/README.md) for details.
 
 ## Building from source

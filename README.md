@@ -141,7 +141,7 @@ MCDR 会把服务端打印的每一行原样回显到控制台。绝大多数情
 | `Steve joined the game` | ✅ 保留 |
 | 任意普通日志行 | ✅ 保留 |
 | `Done (0.648s)! For help, type "help"` | ✅ 保留（MCDR 启动检测正常） |
-| `Stopping the server` | ✅ 保留（MCDR 停止检测正常） |
+| `Stopping server` | ✅ 保留（MCDR 停止检测正常） |
 
 插件日志：
 
@@ -155,16 +155,19 @@ MCDR 会把服务端打印的每一行原样回显到控制台。绝大多数情
 
 ### 运行测试
 
-上面的行为都有对应的自动化测试（`tests/`，共 58 个用例），可以在真实 MCDR 上复跑：
+上面的行为都有对应的自动化测试（`tests/`，共 64 个用例），可以在真实 MCDR 上复跑——**包括本节
+「端到端」这一组**，它会启动一个真正的 MCDR 实例、加载 `pack.py` 产出的 `.mcdr`、并用假服务端
+跑完整个生命周期：
 
 ```bash
 python -m pip install --target .testlibs -r tests/requirements-test.txt
 PYTHONPATH=.testlibs python -m pytest tests -v      # Windows: $env:PYTHONPATH=".testlibs"
 ```
 
-测试断言了本插件最关键的安全属性——被隐去的行**保留 `process`、仅摘掉 `echo_to_console`**。
+测试断言了本插件最关键的安全属性——被隐去的行**保留 `process`、仅摘掉 `echo_to_console`**，
+并且**真的没有出现在控制台上**（端到端用例直接检查 MCDR 的控制台输出）。
 如果未来 MCDR 改变 `hidden()` 的语义，测试会直接失败，而不是让插件在服务器上静默出问题。
-细则见 [tests/README.md](tests/README.md)。
+端到端用例约需 25 秒，可用 `MCDR_SKIP_E2E=1` 跳过。细则见 [tests/README.md](tests/README.md)。
 
 ## 自行打包
 
