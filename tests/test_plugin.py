@@ -20,6 +20,7 @@ Run:  python -m pytest tests -v
 import importlib
 import json
 import pathlib
+import shutil
 import tempfile
 import zipfile
 
@@ -551,6 +552,36 @@ def test_packager_keeps_artifact_small(tmp_path):
     out, names = _build_package(tmp_path)
     assert len(names) < 20, f"unexpectedly many files packed: {names}"
     assert out.stat().st_size < 200 * 1024
+
+
+def test_packager_ships_submodules_recursively(tmp_path, monkeypatch):
+    """Submodules of the plugin package must not be silently dropped.
+
+    Regression guard: an earlier allowlist used ``rel.parent == Path(PACKAGE_NAME)``,
+    which only matches *direct* children. Any ``server_log_filter/sub/helper.py``
+    would have been omitted from the release without any error — a silently
+    broken artifact. The package is only ``__init__.py`` today, so this test
+    plants a submodule in a temporary copy to prove the packer keeps up.
+    """
+    pack = importlib.import_module("pack")
+    src = pathlib.Path(__file__).resolve().parent.parent
+
+    staged = tmp_path / "staged"
+    shutil.copytree(
+        src, staged, ignore=shutil.ignore_patterns(".git", ".testlibs", "__pycache__", "*.pyc")
+    )
+    sub = staged / "server_log_filter" / "sub"
+    sub.mkdir()
+    (sub / "__init__.py").write_text("", encoding="utf-8")
+    (sub / "helper.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    monkeypatch.setattr(pack, "SRC", staged)
+    out = tmp_path / "nested.mcdr"
+    pack.build(out)
+    names = zipfile.ZipFile(out).namelist()
+
+    assert "server_log_filter/sub/__init__.py" in names, names
+    assert "server_log_filter/sub/helper.py" in names, names
 
 
 def test_packager_root_entries_would_be_illegal_if_denylisted():
