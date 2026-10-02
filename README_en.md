@@ -156,7 +156,7 @@ Hidden 3 server log lines from the MCDR console this run (server log file unaffe
 
 ### Running the tests
 
-The behaviour above is covered by an automated suite (`tests/`, 54 cases) that runs against a real MCDR:
+The behaviour above is covered by an automated suite (`tests/`, 58 cases) that runs against a real MCDR:
 
 ```bash
 python -m pip install --target .testlibs -r tests/requirements-test.txt
@@ -178,30 +178,33 @@ MCDR-ServerLogFilter/
 ├── LICENSE
 ├── README.md
 ├── README_en.md
+├── CHANGELOG.md
+├── pack.py
 └── server_log_filter/
     └── __init__.py
 ```
 
-Build (make sure to exclude `__pycache__` and `.pyc`):
+Build with the included, allowlist-based packer:
 
-```python
-import zipfile
-from pathlib import Path
-
-src = Path(".").resolve()
-out = Path("ServerLogFilter-v1.0.1.mcdr")
-skip = {".git", "__pycache__"}
-
-files = [
-    p for p in src.rglob("*")
-    if p.is_file()
-    and not (skip & set(p.parts))
-    and p.suffix != ".pyc"
-]
-with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
-    for p in files:
-        z.write(p, p.relative_to(src).as_posix())
+```bash
+python pack.py            # -> ServerLogFilter-v<version>.mcdr
 ```
+
+> **Why an allowlist and not a skip list?** An earlier version of this section used
+> `rglob("*")` with a short `skip` set, which is a *denylist*: any new file in the repo
+> silently ends up in the release artifact. Two concrete consequences:
+>
+> 1. **The artifact would fail to load at all.** MCDR validates the root entries of a
+>    `.mcdr` (`PackedPlugin._check_dir_legality`) and raises
+>    `IllegalPluginStructure: Packed plugin cannot contain other module` for a root-level
+>    `conftest.py` or `setup.py`. The test suite's `conftest.py` sits exactly there, so the
+>    denylist approach ships a plugin that cannot be loaded.
+> 2. **Runaway size.** After installing `.testlibs/` per `tests/README.md`, the denylist
+>    bundled all of MCDR and its dependencies: measured at **1362 files / 7.11 MB**
+>    (allowlist: 6 files / ~17 KiB).
+>
+> `test_packaged_artifact_is_loadable` in `tests/test_plugin.py` runs `pack.py` and checks
+> the result with MCDR's own validation, so this class of regression cannot come back.
 
 ## Requirements
 

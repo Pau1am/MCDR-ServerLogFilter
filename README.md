@@ -155,7 +155,7 @@ MCDR 会把服务端打印的每一行原样回显到控制台。绝大多数情
 
 ### 运行测试
 
-上面的行为都有对应的自动化测试（`tests/`，共 54 个用例），可以在真实 MCDR 上复跑：
+上面的行为都有对应的自动化测试（`tests/`，共 58 个用例），可以在真实 MCDR 上复跑：
 
 ```bash
 python -m pip install --target .testlibs -r tests/requirements-test.txt
@@ -168,7 +168,7 @@ PYTHONPATH=.testlibs python -m pytest tests -v      # Windows: $env:PYTHONPATH="
 
 ## 自行打包
 
-仓库结构为 MCDR 标准的「根元数据 + 同名代码子包」：
+本插件是 MCDR 标准的「根元数据 + 同名代码子包」：
 
 ```
 MCDR-ServerLogFilter/
@@ -176,30 +176,31 @@ MCDR-ServerLogFilter/
 ├── LICENSE
 ├── README.md
 ├── README_en.md
+├── CHANGELOG.md
 └── server_log_filter/
     └── __init__.py
 ```
 
-打包（务必排除 `__pycache__` 与 `.pyc`）：
+打包时**只准放行上面这些文件**，用「白名单」而不是「黑名单」。仓库里已经附带了这个打包脚本：
 
-```python
-import zipfile
-from pathlib import Path
-
-src = Path(".").resolve()
-out = Path("ServerLogFilter-v1.0.1.mcdr")
-skip = {".git", "__pycache__"}
-
-files = [
-    p for p in src.rglob("*")
-    if p.is_file()
-    and not (skip & set(p.parts))
-    and p.suffix != ".pyc"
-]
-with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
-    for p in files:
-        z.write(p, p.relative_to(src).as_posix())
+```bash
+python pack.py            # 生成 ServerLogFilter-v<版本号>.mcdr
 ```
+
+> **为什么必须用白名单？** 早期版本的这一节用的是 `rglob("*")` 加一个很短的 `skip` 列表，
+> 那是**黑名单**思路，会被仓库里任何新文件悄悄带进发布包。两个具体后果：
+>
+> 1. **发布包直接加载失败。** MCDR 会校验 `.mcdr` 根级条目（`PackedPlugin._check_dir_legality`），
+>    根目录出现 `conftest.py`、`setup.py` 这类模块就抛
+>    `IllegalPluginStructure: Packed plugin cannot contain other module`。测试用的
+>    `conftest.py` 恰好就在根目录，所以黑名单方案会让插件**完全无法加载**。
+> 2. **体积失控。** 按 `tests/README.md` 装了 `.testlibs/` 之后，黑名单会把整个 MCDR
+>    及其依赖一起打进包里：实测 **1362 个文件、7.11 MB**（白名单为 6 个文件、约 17 KiB）。
+>
+> `tests/test_plugin.py` 里的 `test_packaged_artifact_is_loadable` 会跑一遍 `pack.py`，
+> 并用 MCDR 自己的校验逻辑检查产物，所以这类回归不会再溜过去。
+>
+> `pack.py` 本身不进包，原因和 `conftest.py` 相同——根级模块会让 MCDR 拒绝加载。
 
 ## 环境要求
 

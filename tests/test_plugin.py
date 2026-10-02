@@ -17,7 +17,11 @@ MCDR is a hard requirement, not an optional extra: the plugin subclasses
 Run:  python -m pytest tests -v
 """
 
-import sys
+import importlib
+import json
+import pathlib
+import tempfile
+import zipfile
 
 import pytest
 
@@ -466,19 +470,117 @@ def _find_literal(node, name):
 
 
 def test_min_mcdr_version_matches_plugin_metadata():
-    import json
-    import pathlib
-
     meta = json.loads((pathlib.Path(__file__).resolve().parent.parent / "mcdreforged.plugin.json").read_text("utf-8"))
     assert meta["dependencies"]["mcdreforged"] == ">=" + slf.MIN_MCDR_VERSION
 
 
 def test_plugin_metadata_matches_repo_conventions():
-    import json
-    import pathlib
-
     meta = json.loads((pathlib.Path(__file__).resolve().parent.parent / "mcdreforged.plugin.json").read_text("utf-8"))
     assert meta["id"] == "server_log_filter"
     assert meta["license"] == "MIT"
     assert set(meta["description"]) == {"en_us", "zh_cn"}
     assert meta["authors"][0]["name"] == "Pau1am"
+
+
+# ---------------------------------------------------------------------------
+#  7. release packaging
+# ---------------------------------------------------------------------------
+
+class _LegalityZip:
+    """Stands in for PackedPlugin: feeds MCDR's own legality check a real archive.
+
+    ``_check_dir_legality`` only reads the zip and calls ``get_id``, so this is
+    enough to run MCDR's genuine validation without booting an MCDR instance.
+    ``_ILLEGAL_ROOT_PY_FILE_STEM`` is copied onto the class by the tests below.
+    """
+
+    def __init__(self, path, plugin_id):
+        self._zip = zipfile.ZipFile(path)
+        self._plugin_id = plugin_id
+
+    def get_id(self):
+        return self._plugin_id
+
+    @property
+    def _PackedPlugin__zip_file(self):
+        return self._zip
+
+
+def _build_package(tmp_path):
+    """Run the shipped packer and return (archive path, member names)."""
+    pack = importlib.import_module("pack")
+    out = tmp_path / "ServerLogFilter-test.mcdr"
+    pack.build(out)
+    names = zipfile.ZipFile(out).namelist()
+    return out, names
+
+
+def test_packaged_artifact_is_loadable(tmp_path):
+    """The built .mcdr must pass MCDR's own root-entry validation.
+
+    Regression guard: a root-level module (the test suite's own conftest.py, a
+    setup.py, ...) makes MCDR refuse the package with IllegalPluginStructure.
+    """
+    packed = pytest.importorskip("mcdreforged.plugin.type.packed_plugin")
+    meta = json.loads(
+        (pathlib.Path(__file__).resolve().parent.parent / "mcdreforged.plugin.json").read_text("utf-8")
+    )
+    out, _ = _build_package(tmp_path)
+
+    checker = _LegalityZip(out, meta["id"])
+    type(checker)._ILLEGAL_ROOT_PY_FILE_STEM = packed.PackedPlugin._ILLEGAL_ROOT_PY_FILE_STEM
+    # must not raise
+    packed.PackedPlugin._check_dir_legality(checker)
+
+
+def test_packager_excludes_repo_infrastructure(tmp_path):
+    """Sanity check on the shipped artifact's contents."""
+    _, names = _build_package(tmp_path)
+
+    assert "mcdreforged.plugin.json" in names
+    assert "server_log_filter/__init__.py" in names
+
+    for unwanted in ("conftest.py", "pack.py", "tests/test_plugin.py"):
+        assert unwanted not in names, unwanted
+    assert not [n for n in names if n.startswith(".testlibs/") or n.startswith("tests/")]
+    assert not [n for n in names if "__pycache__" in n or n.endswith(".pyc")]
+
+
+def test_packager_keeps_artifact_small(tmp_path):
+    """A stray .testlibs/ once blew this up to 1362 files / 7.11 MB."""
+    out, names = _build_package(tmp_path)
+    assert len(names) < 20, f"unexpectedly many files packed: {names}"
+    assert out.stat().st_size < 200 * 1024
+
+
+def test_packager_root_entries_would_be_illegal_if_denylisted():
+    """Documents *why* the allowlist exists, using a real denylist build.
+
+    The old README recipe (rglob + tiny skip set) produces an archive that MCDR
+    rejects. This test asserts the failure mode is real, so nobody 'simplifies'
+    pack.py back into a denylist.
+    """
+    packed = pytest.importorskip("mcdreforged.plugin.type.packed_plugin")
+    meta = json.loads(
+        (pathlib.Path(__file__).resolve().parent.parent / "mcdreforged.plugin.json").read_text("utf-8")
+    )
+    src = pathlib.Path(__file__).resolve().parent.parent
+
+    denylist_skip = {".git", "__pycache__"}
+    files = [
+        p
+        for p in src.rglob("*")
+        if p.is_file() and not (denylist_skip & set(p.parts)) and p.suffix != ".pyc"
+    ]
+    assert any(p.name == "conftest.py" for p in files), "conftest.py must exist for this guard to matter"
+
+    tmp = tempfile.mkdtemp()
+    archive = pathlib.Path(tmp) / "denylist.mcdr"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+        for p in files:
+            zf.write(p, p.relative_to(src).as_posix())
+
+    checker = _LegalityZip(archive, meta["id"])
+    type(checker)._ILLEGAL_ROOT_PY_FILE_STEM = packed.PackedPlugin._ILLEGAL_ROOT_PY_FILE_STEM
+    with pytest.raises(packed.IllegalPluginStructure):
+        packed.PackedPlugin._check_dir_legality(checker)
