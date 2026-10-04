@@ -123,7 +123,7 @@ def drop_config_descriptions(src):
 
 
 QUARANTINE_CALL = (
-    "    _config_was_reset = _quarantine_broken_config(server, CONFIG_FILE_NAME, raw) is not None\n"
+    "    _config_was_reset = _quarantine_broken_config(server, CONFIG_FILE_NAME, data) is not None\n"
 )
 
 DOC_SUFFIX_LINE = '            suffix = "   （已连续 {} 次零命中）".format(entry.zero_streak)\n'
@@ -167,7 +167,7 @@ def ignore_the_upgrade_switch(src):
 def ignore_the_broken_config_switch(src):
     """无视 announce_broken_config —— 关了也照样播报。"""
     return src.replace(
-        "    if _raw_bool_option(raw, BROKEN_CONFIG_NOTICE_OPTION) is False:\n",
+        '    if _raw_bool_option(raw or "", BROKEN_CONFIG_NOTICE_OPTION) is False:\n',
         "    if False:  # mutation: broken-config switch ignored\n",
         1,
     )
@@ -216,7 +216,7 @@ MCDR_LOOKUP = "    choice = i18n.resolve(setting, _mcdr_language(server))\n"
 NOTE_GUARD = "    if choice.note_key is not None and warn:\n"
 CATALOG_GUARD = "    if problem is not None and warn:\n"
 QUARANTINE_LANGUAGE = (
-    "        server, _raw_str_option(raw, LANGUAGE_OPTION) or i18n.AUTO, warn=False\n"
+    "        setting = _raw_str_option(raw, LANGUAGE_OPTION) or i18n.AUTO\n"
 )
 LOADER_READ = (
     "    try:\n"
@@ -256,7 +256,7 @@ def silence_the_unreadable_catalogue_warning(src):
 def ignore_the_language_in_a_broken_config(src):
     """写坏的配置里写的语言不再被读到 —— 播报会莫名其妙换一种语言。"""
     return src.replace(
-        QUARANTINE_LANGUAGE, "        server, i18n.AUTO, warn=False,  # mutation\n"
+        QUARANTINE_LANGUAGE, "        setting = i18n.AUTO  # mutation: ignore the file\n"
     )
 
 
@@ -272,6 +272,49 @@ def drop_a_placeholder(src):
     data = json.loads(src)
     data["summary.rules_enabled"] = data["summary.rules_enabled"].replace("{count}", "")
     return json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+
+
+def raise_on_an_undecodable_config(src):
+    """不再把「不是 UTF-8」当成配置写坏 —— 解码错误会一路冒到 on_load，插件加载不了。"""
+    return src.replace(
+        '    try:\n'
+        '        return data.decode("utf-8")\n'
+        '    except UnicodeDecodeError:\n'
+        '        return None\n',
+        '    return data.decode("utf-8")  # mutation: decode errors escape\n',
+    )
+
+
+def drop_the_probe_floor(src):
+    """去掉探测预算的下限 —— 预算写成 0 时每一条规则都会被判成「太慢」而拒掉。"""
+    return src.replace(
+        "        probe_budget_ms = max(1, probe_budget_ms)\n",
+        "        pass  # mutation: no floor\n",
+    )
+
+
+def drop_the_test_prefix_strip(src):
+    """!!logfilter test 不再剥掉控制台前缀 —— `^` 锚定的规则会被误报成不命中。"""
+    return src.replace(
+        '    body = _LOG_LINE_PREFIX.sub("", text, count=1) or text\n',
+        "    body = text  # mutation: no prefix strip\n",
+    )
+
+
+def narrow_the_compile_catch(src):
+    """回到只接 re.error —— 一个打错的量化符就能把整个 on_load 带下去。"""
+    return src.replace(
+        "        except (re.error, OverflowError, RecursionError) as error:\n",
+        "        except re.error as error:  # mutation: too narrow\n",
+    )
+
+
+def narrow_the_format_catch(src):
+    """格式化失败不再兜住 AttributeError —— 一个 `{a.b}` 的笔误就能让消息路径抛异常。"""
+    return src.replace(
+        "    except (KeyError, IndexError, ValueError, AttributeError, TypeError):\n",
+        "    except (KeyError, IndexError, ValueError):  # mutation: too narrow\n",
+    )
 
 
 # (名称, 被改的文件, 改法, pytest 选择器)
@@ -334,6 +377,16 @@ MUTATIONS = [
      ["tests/test_plugin.py", "-k", "same_keys"]),
     ("a placeholder dropped from a translation", LANG_ZH, drop_a_placeholder,
      ["tests/test_plugin.py", "-k", "keeps_the_placeholders"]),
+    ("an undecodable config treated as fatal", SRC, raise_on_an_undecodable_config,
+     ["tests/test_plugin.py", "-k", "not_utf8"]),
+    ("the probe budget floor removed", SRC, drop_the_probe_floor,
+     ["tests/test_plugin.py", "-k", "nonsense_probe_budget"]),
+    ("the console prefix no longer stripped", SRC, drop_the_test_prefix_strip,
+     ["tests/test_plugin.py", "-k", "strips_the_console_prefix"]),
+    ("the compile catch narrowed back to re.error", SRC, narrow_the_compile_catch,
+     ["tests/test_plugin.py", "-k", "overflows_is_skipped or deeply_nested_is_skipped"]),
+    ("the format catch narrowed again", I18N, narrow_the_format_catch,
+     ["tests/test_plugin.py", "-k", "bad_attribute_is_returned"]),
 ]
 
 def pytest_ok(workdir, selector):

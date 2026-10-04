@@ -180,8 +180,10 @@ no restart needed.
 > Without moving the original aside first, your rules would simply be gone.
 > `config.json.old` is a single backup slot — a later failure replaces it.
 
-Also treated as broken: an empty file, or a file whose top level is not a JSON object
-(say, the whole file is an array).
+Also treated as broken: an empty file, a file whose top level is not a JSON object (say, the
+whole file is an array), and **a file that is not UTF-8** — which is what an editor on Chinese
+Windows produces when saving as "ANSI". (Your `language` cannot be read in that case either,
+so that notice comes out in MCDR's own language.)
 
 To skip that report, set `announce_broken_config` to `false`. **The backup still happens** —
 only the message is silenced. The one exception is the "even the backup failed" error, which
@@ -269,13 +271,16 @@ Two details worth knowing:
 
 | Command | Permission | Description |
 |---|---|---|
-| `!!logfilter` | user | Show status: rule count, per-rule hits and idle streaks |
+| `!!logfilter` | user | Show status: rule count, per-rule hits and idle streaks, the active language and where it came from, and how many rules were skipped |
 | `!!logfilter list` | user | Same as above |
 | `!!logfilter test <text>` | user | Check whether a line would be hidden, and which rule matches |
 | `!!logfilter reload` | admin | Re-read the config file and apply it immediately; also forgets rules removed from it |
 | `!!logfilter reset` | admin | Clear the idle-session counters and start observing again |
 
 `!!logfilter test` is especially handy: paste a line from your log to verify the rule without waiting for it to actually fire.
+Pasting the whole console line works too — the `[time] [thread/level]:` prefix is stripped first,
+so the test matches the body the filter really sees (otherwise `^`-anchored rules report a
+false negative).
 
 ## Adding more rules
 
@@ -315,6 +320,8 @@ Those same lines are **still complete** in `server/logs/latest.log`.
 | A rule does not seem to work | `!!logfilter test <a log line>` to see whether it would be hidden; then `!!logfilter reload` |
 | A rule is reported as idle | Its regex is probably wrong, or that log line no longer occurs — follow the advice in the reminder |
 | The config file was reset | Look for `config.json.old`: that is your original file. The message names the cause and the line number |
+| It was reset because the file is "not valid UTF-8" | Your editor saved it as ANSI/GBK; re-save it as UTF-8 (copy the content back from `config.json.old`) |
+| Which language is it speaking? | Run `!!logfilter`: the status line names the language and whether it follows MCDR or is pinned in the config |
 | Temporarily disable filtering | Empty `patterns`, then `!!logfilter reload` |
 
 ## Requirements & compatibility

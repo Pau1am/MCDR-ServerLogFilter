@@ -1219,12 +1219,37 @@ def test_on_load_respects_validate_patterns_false():
 
 
 def test_on_load_honours_the_timeout_setting():
-    """A budget of 0 ms must trip even a benign pattern, proving the knob is wired."""
-    server = start_plugin(
-        config={"patterns": [LIVE], "pattern_probe_timeout_ms": 0}
-    )
-    assert slf._log_filter.rules == ()
-    assert any("灾难性回溯" in msg for msg in server.logger.errors)
+    """Wiring guard: the configured budget is what the probe actually receives."""
+    seen = []
+    original = slf._probe_pattern
+
+    def spy(regex, budget_ms):
+        seen.append(budget_ms)
+        return original(regex, budget_ms)
+
+    slf._probe_pattern = spy
+    try:
+        start_plugin(config={"patterns": [LIVE], "pattern_probe_timeout_ms": 7})
+    finally:
+        slf._probe_pattern = original
+
+    assert seen == [7]
+
+
+def test_a_nonsense_probe_budget_does_not_reject_every_rule():
+    """A budget of 0 ms means "every cost is too much", so it used to refuse *all* rules.
+
+    Worse, each refusal blamed catastrophic backtracking — for a pattern that is a plain
+    literal. The filter then silently hid nothing while the log pointed at the wrong
+    cause. The budget is floored at 1 ms, which still separates microseconds (real rules)
+    from hundreds of milliseconds (dangerous ones).
+    """
+    for budget in (0, -5):
+        server = start_plugin(
+            config={"patterns": [LIVE], "pattern_probe_timeout_ms": budget}
+        )
+        assert len(slf._log_filter.rules) == 1, "rule lost at budget={}".format(budget)
+        assert server.logger.errors == [], server.logger.errors
 
 
 def test_probing_realistic_patterns_stays_cheap():
@@ -1648,9 +1673,9 @@ def test_on_load_checks_the_config_file():
     server = FakePluginServer(config_data={"patterns": [LIVE]})
     original = slf._quarantine_broken_config
 
-    def spy(srv, name, raw=None):
+    def spy(srv, name, data=None):
         checked.append(name)
-        return original(srv, name, raw)
+        return original(srv, name, data)
 
     slf._quarantine_broken_config = spy
     try:
@@ -1665,9 +1690,9 @@ def test_reload_command_checks_the_config_file_too():
     checked = []
     original = slf._quarantine_broken_config
 
-    def spy(srv, name, raw=None):
+    def spy(srv, name, data=None):
         checked.append(name)
-        return original(srv, name, raw)
+        return original(srv, name, data)
 
     slf._quarantine_broken_config = spy
     try:
@@ -2163,3 +2188,141 @@ def test_the_english_catalogue_is_actually_english():
     for key, template in catalogue("en_us").items():
         cjk = [c for c in template if "\u4e00" <= c <= "\u9fff"]
         assert not cjk, "{} is not translated: {!r}".format(key, template)
+
+
+# ---------------------------------------------------------------------------
+#  14. 1.2.3: an undecodable config, the test-prefix trap, and !!logfilter
+# ---------------------------------------------------------------------------
+
+
+def server_with_raw_config(tmp_path, data):
+    """A fake server whose data folder holds exactly ``data`` as config.json."""
+    folder = tmp_path / "cfg"
+    folder.mkdir()
+    (folder / "config.json").write_bytes(data)
+    return FakePluginServer(data_folder=str(folder)), folder
+
+
+def test_a_config_that_is_not_utf8_is_quarantined(tmp_path):
+    """ANSI/GBK is what an editor on Chinese Windows writes by default.
+
+    MCDR cannot parse such a file either, so it belongs on the same backup-and-reset path
+    as a syntax error. Before the fix it raised UnicodeDecodeError — a ValueError, so the
+    ``except OSError`` there did not catch it — and the plugin failed to load at all.
+    """
+    payload = '{"patterns": ["中文规则"]}'.encode("gbk")
+    server, folder = server_with_raw_config(tmp_path, payload)
+    slf._language = "zh_cn"
+
+    reason = slf._quarantine_broken_config(server, slf.CONFIG_FILE_NAME)
+
+    assert reason is not None, "an undecodable file is a broken config"
+    backup = folder / (slf.CONFIG_FILE_NAME + slf.CONFIG_BACKUP_SUFFIX)
+    assert backup.read_bytes() == payload, "the original bytes are kept verbatim"
+    assert any("UTF-8" in m for m in server.logger.errors), server.logger.errors
+    assert not (folder / slf.CONFIG_FILE_NAME).exists(), "the file was moved aside"
+
+
+def test_on_load_survives_a_config_that_is_not_utf8(tmp_path):
+    """The decode error must not reach on_load: that is what killed the plugin."""
+    payload = '{"patterns": ["中文规则"]}'.encode("gbk")
+    server, folder = server_with_raw_config(tmp_path, payload)
+
+    slf.on_load(server, None)  # must not raise
+
+    assert slf._log_filter is not None, "the filter is still installed"
+    assert (folder / (slf.CONFIG_FILE_NAME + slf.CONFIG_BACKUP_SUFFIX)).exists()
+    assert len(slf._log_filter.rules) == 1, "the regenerated default config is in force"
+
+
+def test_the_test_command_strips_the_console_prefix():
+    """``^``-anchored rules are the trap here.
+
+    The filter matches the body MCDR has already stripped, while admins paste the whole
+    console line. Without stripping, ``!!logfilter test`` answers "no match" for a rule
+    that works in practice — and the user goes off to break a rule that was correct.
+    """
+    start_plugin(config={"patterns": [r"^Player \w+ joined"]})
+    hit = FakeSource()
+    slf._test_line(
+        hit, {"text": '[12:00:00] [Server thread/INFO]: Player Steve joined the game'}
+    )
+
+    text = "".join(str(x) for x in hit.replies)
+    assert "命中规则" in text, text
+    assert "不匹配" not in text, text
+    assert "前缀" in text, "the reply must say the prefix was stripped: {}".format(text)
+
+
+def test_the_test_command_stays_quiet_without_a_prefix():
+    start_plugin(config={"patterns": [LIVE]})
+    hit = FakeSource()
+    slf._test_line(hit, {"text": "Player Steve " + LIVE})
+    assert "前缀" not in "".join(str(x) for x in hit.replies)
+
+
+def test_status_shows_the_language_and_where_it_came_from():
+    """The 1.2.2 headline feature must be checkable without reading the config file."""
+    start_plugin(config={"patterns": [LIVE], "language": "en_us"}, state=None)
+    fixed = FakeSource()
+    slf._show_status(fixed)
+    assert "Language: en_us (set in the config)" in "".join(
+        str(x) for x in fixed.replies
+    )
+
+    start_plugin(config={"patterns": [LIVE]}, state=None, mcdr_language="en_us")
+    following = FakeSource()
+    slf._show_status(following)
+    assert "Language: en_us (following MCDR)" in "".join(
+        str(x) for x in following.replies
+    )
+
+
+def test_status_reports_skipped_rules_and_the_last_hit():
+    """Both used to be invisible: a rejected rule, and when a rule last fired."""
+    start_plugin(
+        config={"patterns": [LIVE, r"(a+)+$"]},
+        state={"session_index": 3, "rules": {LIVE: {"last_hit_session": 2}}},
+    )
+    status = FakeSource()
+    slf._show_status(status)
+
+    text = "".join(str(x) for x in status.replies)
+    assert "条规则已被跳过" in text, text
+    assert "上次命中：第 2 个开服周期" in text, text
+
+
+def test_a_pattern_that_overflows_is_skipped_not_fatal():
+    """``a{999999999999}`` is a fat-fingered quantifier, not a re.error.
+
+    ``re.compile`` raises OverflowError for it, which the old ``except re.error`` missed —
+    so one typo took down ``on_load`` instead of just that one rule.
+    """
+    server = FakePluginServer()
+    rules = slf._build_rules(server, [LIVE, "a{999999999999}", "joined the game"])
+
+    assert [r.pattern for r in rules] == [LIVE, "joined the game"], "good rules survived"
+    assert len(server.logger.warnings) == 1, server.logger.warnings
+    assert "999999999999" in server.logger.warnings[0]
+
+
+def test_a_deeply_nested_pattern_is_skipped_not_fatal():
+    """Thousands of nested groups blow the C stack while compiling, not re.error."""
+    pattern = "(" * 600 + "a" + ")" * 600
+    server = FakePluginServer()
+
+    rules = slf._build_rules(server, [LIVE, pattern])
+
+    assert [r.pattern for r in rules] == [LIVE]
+    assert len(server.logger.warnings) == 1
+
+
+def test_a_template_with_a_bad_attribute_is_returned_raw():
+    """The "a bad translation can never raise" promise has to include ``{a.b}``."""
+    import server_log_filter.i18n as i18n
+
+    i18n._CATALOGS["xx_broken"] = i18n.Catalog({"t": "{a.b}"}, None)
+    try:
+        assert i18n.translate("t", "xx_broken", a=1) == "{a.b}"
+    finally:
+        i18n._CATALOGS.pop("xx_broken", None)

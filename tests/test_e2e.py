@@ -818,3 +818,58 @@ def test_the_packaged_plugin_carries_its_language_files(tmp_path_factory):
             )
         }
     assert keys["zh_cn"] == keys["en_us"], "the shipped catalogues disagree"
+
+
+# ---------------------------------------------------------------------------
+#  a config that is not valid UTF-8 (an editor on Chinese Windows writes ANSI/GBK)
+# ---------------------------------------------------------------------------
+
+GBK_CONFIG = (
+    '{\n'
+    '    "language": "zh_cn",\n'
+    '    "patterns": [\n'
+    '        "中文规则"\n'
+    '    ]\n'
+    '}\n'
+).encode("gbk")
+
+
+@pytest.fixture(scope="module")
+def non_utf8_config_e2e_output(tmp_path_factory):
+    """One MCDR run whose config.json holds GBK-encoded bytes."""
+    _require_mcdr()
+    root = tmp_path_factory.mktemp("mcdr_e2e_gbk")
+    _build_instance(root)
+    # exactly what an editor on Chinese Windows produces when saving as "ANSI"
+    (root / "config" / "server_log_filter" / "config.json").write_bytes(GBK_CONFIG)
+    return run_mcdr(root), root
+
+
+def test_a_non_utf8_config_is_backed_up_byte_for_byte(non_utf8_config_e2e_output):
+    """It cannot even be decoded as text, so it has to be preserved as raw bytes."""
+    _, root = non_utf8_config_e2e_output
+    backup = root / "config" / "server_log_filter" / "config.json.old"
+    assert backup.is_file(), "the undecodable file was not preserved"
+    assert backup.read_bytes() == GBK_CONFIG
+
+
+def test_a_non_utf8_config_does_not_stop_the_plugin(non_utf8_config_e2e_output):
+    """This used to raise UnicodeDecodeError inside on_load: no plugin at all.
+
+    The notice is English here, and that is correct: the plugin reads the language from
+    the config file's own text, which is precisely what cannot be read. MCDR's own
+    language is the only sensible fallback left.
+    """
+    output, root = non_utf8_config_e2e_output
+    assert "Enabled 1 log filter rule(s)" in output, output[-2000:]
+    echoed = echoed_server_lines(output)
+    assert [l for l in echoed if TARGET in l] == [], "filtering stopped working"
+    assert (root / "startup_event_fired").is_file(), "lifecycle events broke"
+
+
+def test_the_non_utf8_reset_names_the_real_cause(non_utf8_config_e2e_output):
+    """A missing-comma message here would send the admin hunting for the wrong thing."""
+    output, _ = non_utf8_config_e2e_output
+    assert "has been reset to the default config" in output
+    assert "not valid UTF-8" in output, output[-2000:]
+    assert "config.json.old" in output

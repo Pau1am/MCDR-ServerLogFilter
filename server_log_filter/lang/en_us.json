@@ -29,6 +29,7 @@
 
   "broken.json_error": "JSON syntax error: {error}",
   "broken.not_an_object": "the top level should be a JSON object, but it is {kind}",
+  "broken.not_utf8": "the file is not valid UTF-8 text (a common cause: it was saved as ANSI/GBK by an editor on Windows)",
   "broken.backup_failed": "[ServerLogFilter] The config file cannot be parsed, and backing it up to {file}.old failed too ({error}). The original file may have been reset -- please check.",
   "broken.title": "[ServerLogFilter] The config file cannot be parsed; it has been reset to the default config",
   "broken.file_line": "  - The file at fault: {path}",
@@ -57,12 +58,16 @@
   "status.rule_count": "Rules: ",
   "status.hidden_now": "    hidden this session: ",
   "status.lines": " line(s)",
+  "status.language_auto": "Language: {code} (following MCDR)",
+  "status.language_set": "Language: {code} (set in the config)",
   "status.no_rules": "(no rules -- add some to patterns in the config file)",
   "status.rule_index": " [{index:>2}] ",
   "status.rule_hits": "{count:>5} hit(s)  ",
   "status.streak_warn": "   ⚠ idle for {streak} sessions",
   "status.streak": "   (idle for {streak} sessions)",
+  "status.last_hit": "   (last hit: session {session})",
   "status.sessions": "{count} session(s) recorded",
+  "status.rejected": "{count} rule(s) were skipped (bad regex or backtracking risk -- see the MCDR log)",
   "status.tip": "Note: the server's own log is unaffected; hidden lines are still dispatched to plugin events.",
   "reload.done": "Filter rules reloaded",
   "reload.count": "({count} rule(s) active)",
@@ -73,6 +78,7 @@
   "test.hit_detail": "    matched by: ",
   "test.miss": "would not be hidden",
   "test.miss_detail": "    no rule matches this line",
+  "test.stripped_note": "(the [time] [thread/level]: prefix was stripped, so this tested the body that is actually matched)",
 
   "config_doc.language": "Message language. auto follows MCDR's current language setting (config.yml); zh_cn / en_us also work.",
   "config_doc.patterns": "The log lines to hide. A list of regexes; a line matching any of them is not shown on the MCDR console (the server's own log file is unaffected).",
@@ -81,7 +87,7 @@
   "config_doc.warn_about_stale_rules": "When true, a rule that matches nothing for several sessions is reported once, so dead rules can be cleaned up.",
   "config_doc.stale_rule_threshold": "How many consecutive idle sessions before the reminder. Set to 0 to disable it.",
   "config_doc.validate_patterns": "When true, patterns that would freeze the main thread (such as (a+)+$) are rejected at load time and reported in the log.",
-  "config_doc.pattern_probe_timeout_ms": "Time budget (ms) for that check. A normal rule takes about 1 us, so there is normally no reason to change it.",
+  "config_doc.pattern_probe_timeout_ms": "Time budget (ms) for that check. A normal rule takes about 1 us, so there is normally no reason to change it. Values below 1 are treated as 1.",
   "config_doc.announce_config_upgrade": "When true, a plugin upgrade that fills in new config options also lists them in the console.",
   "config_doc.announce_broken_config": "When true, an unparseable config that gets backed up and reset is explained in the console, including the backup path."
 }
