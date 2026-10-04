@@ -216,7 +216,7 @@ because noise lines never take part in lifecycle detection. See [tests/README.md
 
 ### Running the tests
 
-The behaviour above is covered by an automated suite (`tests/`, 112 cases) that runs against a real
+The behaviour above is covered by an automated suite (`tests/`, 113 cases) that runs against a real
 MCDR — **including the end-to-end group below**, which boots an actual MCDR instance, loads the
 `.mcdr` produced by `pack.py`, and drives a fake server through a full lifecycle:
 
@@ -241,8 +241,8 @@ The repository follows MCDR's standard layout — root metadata plus a same-name
 MCDR-ServerLogFilter/
 ├── mcdreforged.plugin.json
 ├── LICENSE
-├── README.md
-├── README_en.md
+├── README.md            ← not shipped
+├── README_en.md         ← not shipped
 ├── CHANGELOG.md
 ├── pack.py
 └── server_log_filter/
@@ -255,6 +255,18 @@ Build with the included, allowlist-based packer:
 python pack.py            # -> ServerLogFilter-v<version>.mcdr
 ```
 
+The release artifact contains exactly **4 files** (about 14 KiB):
+
+| File | Purpose |
+|---|---|
+| `mcdreforged.plugin.json` | plugin metadata (required) |
+| `server_log_filter/__init__.py` | the plugin code |
+| `CHANGELOG.md` | shipped changelog |
+| `LICENSE` | MIT licence |
+
+Neither README is packaged: MCDR never reads them, they duplicate the release page, and
+dropping them halves the artifact (28 KB -> 14 KB).
+
 > **Why an allowlist and not a skip list?** An earlier version of this section used
 > `rglob("*")` with a short `skip` set, which is a *denylist*: any new file in the repo
 > silently ends up in the release artifact. Two concrete consequences:
@@ -265,11 +277,11 @@ python pack.py            # -> ServerLogFilter-v<version>.mcdr
 >    `conftest.py` or `setup.py`. The test suite's `conftest.py` sits exactly there, so the
 >    denylist approach ships a plugin that cannot be loaded.
 > 2. **Runaway size.** After installing `.testlibs/` per `tests/README.md`, the denylist
->    bundled all of MCDR and its dependencies: measured at **1362 files / 7.11 MB**
->    (allowlist: 6 files / ~17 KiB).
+>    bundled all of MCDR and its dependencies: measured at **1362 files / 7.11 MB**.
 >
 > `test_packaged_artifact_is_loadable` in `tests/test_plugin.py` runs `pack.py` and checks
-> the result with MCDR's own validation, so this class of regression cannot come back.
+> the result with MCDR's own validation, and `test_packager_ships_exactly_the_allowlist`
+> pins the artifact's contents so the list cannot drift again.
 
 ## Requirements
 

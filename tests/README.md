@@ -1,6 +1,6 @@
 # 测试 / Tests
 
-本目录是 Server Log Filter 的测试套件。**112 个用例**，覆盖过滤行为、配置、
+本目录是 Server Log Filter 的测试套件。**113 个用例**，覆盖过滤行为、配置、
 命令面、发布打包、**真实 MCDR 端到端**，以及本插件最核心的安全属性
 （被隐去的行仍保留 `process`，事件照常分发）。
 
@@ -31,7 +31,7 @@ $env:PYTHONPATH=".testlibs"; python -m pytest tests -v
 预期输出结尾：
 
 ```
-112 passed
+113 passed
 ```
 
 ## 覆盖内容
@@ -44,12 +44,12 @@ $env:PYTHONPATH=".testlibs"; python -m pytest tests -v
 | 配置对象 | 3 | 默认值与 README 文档一致；JSON 反序列化；往返稳定 |
 | MCDR 契约 | 2 | `InfoActionFlag.hidden()` 的常量构成；`InfoFilter` 允许改写 `action_flag` |
 | 命令面与元数据 | 8 | `on_load` 注册项；状态/测试/重载命令输出；`reload` 的 ADMIN 权限门禁；插件元数据与 `MIN_MCDR_VERSION` 同步 |
-| 发布打包 | 5 | 见下 |
+| 发布打包 | 6 | 见下 |
 | **零命中提醒** | **13** | 阈值语义、命中归零、启动失败不计入、热重载不误判、可关闭、`reset`、历史持久化，见下 |
 | **灾难性回溯防护** | **21** | 8 种真实写法全部放行；4 类危险模式被拦下；开关与超时可配置且**确实接在 `on_load` 上** |
 | **轻量化不变量** | **6** | 热路径的结构性断言（缓存 `hidden()`、无规则短路、命中即停），外加两条宽松的耗时护栏 |
 | **端到端（真实 MCDR）** | **13** | 见下 |
-| **合计** | **112** | |
+| **合计** | **113** | |
 
 > 计数含 `@pytest.mark.parametrize` 展开后的用例数，与 `pytest --collect-only` 一致。
 
@@ -134,12 +134,16 @@ if handler.test_server_startup_done(info):
 
 ## 发布打包的回归防护
 
-`pack.py` 是仓库唯一的打包器，它的产物由这里 5 个用例把关：
+`pack.py` 是仓库唯一的打包器，它的产物由这里 6 个用例把关：
 
 - `test_packaged_artifact_is_loadable` —— 跑一遍 `pack.py`，把产物交给 **MCDR 自己的**
   `PackedPlugin._check_dir_legality` 校验
 - `test_packager_excludes_repo_infrastructure` —— `conftest.py` / `pack.py` / `tests/` /
   `.testlibs/` / `__pycache__` 都不在包里
+- `test_packager_ships_exactly_the_allowlist` —— **把产物内容钉死为 4 个文件**
+  （`mcdreforged.plugin.json` / `server_log_filter/__init__.py` / `CHANGELOG.md` / `LICENSE`），
+  并断言两个 README **不在**包里。这样任何对白名单的改动都必须显式改测试，
+  避免再出现「体积悄悄变了但没人知道」
 - `test_packager_keeps_artifact_small` —— 文件数 < 20 且 < 200 KiB
 - `test_packager_ships_submodules_recursively` —— 在临时副本里植入
   `server_log_filter/sub/helper.py`，断言它**确实被打了进去**

@@ -6,6 +6,37 @@
 
 ---
 
+## [1.1.1] - 2026-10-04
+
+### 变更
+
+**发布包不再包含两个 README，产物体积减半：28 KB → 14 KB。**
+
+`README.md` / `README_en.md` 从打包白名单中移除。理由：MCDR 从不读取它们，
+内容与 Releases 页面重复，而两者加起来占了整个包压缩体积的 **49.6%**
+（13,783 字节 / 27,805 字节）。
+
+发布包内容现在是固定的 4 个文件：
+
+| 文件 | 说明 |
+| --- | --- |
+| `mcdreforged.plugin.json` | 插件元数据（必需） |
+| `server_log_filter/__init__.py` | 插件代码 |
+| `CHANGELOG.md` | 变更记录，随包分发 |
+| `LICENSE` | MIT 许可证 |
+
+`CHANGELOG.md` 与 `LICENSE` **保留在包内**：前者是「本次改了什么写进包内自带说明文件」
+这一约定的载体，后者随分发更符合 MIT 的常规做法。
+
+新增 `test_packager_ships_exactly_the_allowlist`，把产物内容钉死——
+以后任何对白名单的改动都会让测试变红，必须显式修改测试，
+不会再有「体积悄悄变了但没人说」的情况。
+
+> **行为没有任何变化。** 这一版只动打包清单，插件代码、配置项、命令与
+> 兼容性要求（MCDR >= 2.15.0）与 1.1.0 完全一致。仅为了拿到更小的包才需要升级。
+
+---
+
 ## [1.1.0] - 2026-10-04
 
 ### 新增
@@ -125,6 +156,7 @@ MC 侧结论不变：过滤在 MCDR 侧完成，**与 MC 版本无耦合**。
 - 配置：`config/server_log_filter/config.json` 的 `patterns[]` / `log_matched_lines` / `report_on_server_stop`。
 - 匹配使用 `re.search`（包含匹配），正则**不要**自己加 `.*`。
 
+[1.1.1]: https://github.com/Pau1am/MCDR-ServerLogFilter/releases/tag/v1.1.1
 [1.1.0]: https://github.com/Pau1am/MCDR-ServerLogFilter/releases/tag/v1.1.0
 [1.0.2]: https://github.com/Pau1am/MCDR-ServerLogFilter/releases/tag/v1.0.2
 [1.0.1]: https://github.com/Pau1am/MCDR-ServerLogFilter/releases/tag/v1.0.1

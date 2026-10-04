@@ -16,7 +16,11 @@ Only these are shipped:
 
 * ``mcdreforged.plugin.json`` — package metadata (required)
 * ``server_log_filter/**.py`` — the plugin code, recursively (submodules included)
-* ``LICENSE``, ``README.md``, ``README_en.md``, ``CHANGELOG.md`` — documentation
+* ``LICENSE``, ``CHANGELOG.md`` — licence text and the shipped changelog
+
+``README.md`` / ``README_en.md`` are deliberately **excluded**: they are long, they
+duplicate what the release page already says, and MCDR never reads them. Keeping
+them out cuts roughly half off the artifact.
 
 ``pack.py`` itself is intentionally **not** included, for the same root-module reason.
 """
@@ -29,11 +33,12 @@ from pathlib import Path
 SRC = Path(__file__).resolve().parent
 
 # Root-level files that ship with the plugin.
+#
+# README.md / README_en.md are intentionally absent: MCDR never reads them, they
+# duplicate the release page, and together they were over half the artifact size.
 ROOT_FILES = {
     "mcdreforged.plugin.json",
     "LICENSE",
-    "README.md",
-    "README_en.md",
     "CHANGELOG.md",
 }
 
