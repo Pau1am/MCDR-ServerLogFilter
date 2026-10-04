@@ -113,6 +113,18 @@ class Config(Serializable):
     pattern_probe_timeout_ms: int = 25
     """单条规则单个探测串的耗时上限（毫秒）。正常规则约 1 µs，余量超过一万倍。"""
 
+    announce_config_upgrade: bool = True
+    """插件升级后配置被自动补齐时，在控制台说明本次新增了哪些选项。"""
+
+    announce_broken_config: bool = True
+    """配置文件解析失败、被备份并重置时，在控制台说明原因与备份路径。"""
+
+
+# `announce_broken_config` 的选项名。写成常量供 _quarantine_broken_config 使用：
+# 那一刻配置已经读不出来了，只能拿这个名字去文件原文里找。测试会钉住它必须
+# 是 Config 里真实存在的字段，改名时不会悄悄失配。
+BROKEN_CONFIG_NOTICE_OPTION = "announce_broken_config"
+
 
 # --------------------------------------------------------------------------
 #  配置项一览（用于升级提示）
@@ -153,6 +165,14 @@ CONFIG_DOC: Dict[str, Tuple[str, str]] = {
     "pattern_probe_timeout_ms": (
         "1.1.0",
         "上面那项检查的耗时上限（毫秒）。正常规则约 1 µs，一般无需改动。",
+    ),
+    "announce_config_upgrade": (
+        "1.3.0",
+        "true 时，插件更新后若配置被自动补齐，会在控制台列出本次新增的选项。",
+    ),
+    "announce_broken_config": (
+        "1.3.0",
+        "true 时，配置文件解析失败被备份并重置时，会在控制台说明原因与备份路径。",
     ),
 }
 
@@ -449,13 +469,38 @@ def _announce_new_options(server: PluginServerInterface) -> None:
 
 
 def _load_config(server: PluginServerInterface) -> Config:
-    """读取配置：自动补齐新增选项，并在有新增时给出提示。"""
+    """读取配置：自动补齐新增选项，并在有新增时给出提示。
+
+    补齐动作本身照常进行、不受任何开关影响——`announce_config_upgrade` 只管
+    「说不说」。把它关掉不会让配置少补一个键，只是你不再收到那段说明。
+    """
     global _newly_added_options, _config_was_reset
     _newly_added_options = []
     _config_was_reset = _quarantine_broken_config(server, CONFIG_FILE_NAME) is not None
     config = server.load_config_simple(target_class=Config, data_processor=_config_migrator)
-    _announce_new_options(server)
+    if config.announce_config_upgrade:
+        _announce_new_options(server)
     return config
+
+
+def _raw_bool_option(raw: str, name: str) -> Optional[bool]:
+    """从一段（可能根本不是合法 JSON 的）文本里尽力读出某个布尔选项。
+
+    **只在配置文件已经写坏时才需要**：那一刻用户真正的设置只存在于这份原文里
+    （文件马上要被备份、配置马上要被重置成默认值），正规解析器已经派不上用场。
+    于是退化成一次 ``"name": true|false`` 的文本查找——顶层的缩进与顺序怎么写
+    都不影响，找不到就返回 ``None``，由调用方决定默认行为。
+
+    找不到与 ``true`` 是一回事：默认开启，照常提示。
+    """
+    match = re.search(
+        r'"{}"\s*:\s*(true|false)\b'.format(re.escape(name)),
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    return match.group(1).lower() == "true"
 
 
 def _quarantine_broken_config(
@@ -471,6 +516,10 @@ def _quarantine_broken_config(
     最常见的触发方式就是往 ``patterns`` 数组里加规则时漏了一个逗号。
 
     先把原文件挪走，用户就能照着自己写的那份把内容抄回来。
+
+    ``announce_broken_config`` 只决定要不要把上面这段说明**说出来**，备份动作
+    本身永远执行。开关的值只能从原文里读（见 ``_raw_bool_option``）——此刻
+    配置已经解析失败，没有别的地方能拿到用户当初的设置。
     """
     path = os.path.join(server.get_data_folder(), file_name)
     if not os.path.isfile(path):
@@ -496,10 +545,16 @@ def _quarantine_broken_config(
     try:
         os.replace(path, backup)
     except OSError as error:
+        # 连备份都失败，意味着原文件真的会被 MCDR 覆盖掉——这是数据丢失，
+        # 不属于「提示」，因此不受 announce_broken_config 开关影响，一律报出来。
         server.logger.error(
             "[ServerLogFilter] 配置文件无法解析，但备份到 {}.old 也失败了（{}）。"
             "原文件可能已被重置，请注意保存。".format(file_name, error)
         )
+        return reason
+
+    if _raw_bool_option(raw, BROKEN_CONFIG_NOTICE_OPTION) is False:
+        # 用户把这盏灯关掉了。备份照做（上面那步），只是不再播报这一段。
         return reason
 
     server.logger.error(

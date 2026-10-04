@@ -342,6 +342,8 @@ def test_legacy_config_is_upgraded_in_place(e2e_output):
         "stale_rule_threshold",
         "validate_patterns",
         "pattern_probe_timeout_ms",
+        "announce_config_upgrade",
+        "announce_broken_config",
     }
 
     # the user's own values survived the migration untouched
@@ -383,9 +385,12 @@ def test_upgrade_is_announced_with_versions(e2e_output):
         ("stale_rule_threshold", "1.1.0"),
         ("validate_patterns", "1.1.0"),
         ("pattern_probe_timeout_ms", "1.1.0"),
+        ("announce_config_upgrade", "1.3.0"),
+        ("announce_broken_config", "1.3.0"),
     ):
         assert name in output, "new option {} was not listed".format(name)
     assert "v1.1.0 加入" in output
+    assert "v1.3.0 加入" in output
 
 
 def test_plugin_keeps_its_state_file_out_of_the_user_config(e2e_output):
@@ -568,6 +573,69 @@ def test_reset_is_announced_with_the_reason_and_the_backup_path(broken_config_e2
 def test_plugin_still_works_after_a_config_reset(broken_config_e2e_output):
     """A bad config must not take the plugin down with it."""
     output, root = broken_config_e2e_output
+    assert "已启用 1 条日志过滤规则" in output, "it should fall back to the default rule"
+    echoed = echoed_server_lines(output)
+    assert [l for l in echoed if TARGET in l] == [], "filtering stopped working"
+    assert (root / "startup_event_fired").is_file(), "lifecycle events broke"
+
+
+# ---------------------------------------------------------------------------
+#  the two notice switches (announce_config_upgrade / announce_broken_config)
+# ---------------------------------------------------------------------------
+
+def test_upgrade_announcement_is_silent_when_switched_off(tmp_path_factory):
+    """Switching the notice off must not stop the config from being completed.
+
+    The run is seeded with a 1.0.x-era config *plus* the switch, so MCDR adds six
+    missing options. Normally that is announced; here the admin asked for quiet.
+    """
+    _require_mcdr()
+    root = tmp_path_factory.mktemp("mcdr_e2e_quiet_upgrade")
+    _build_instance(root, plugin_config={"announce_config_upgrade": False})
+    output = run_mcdr(root)
+
+    assert "配置已更新" not in output, "the notice was supposed to be silenced"
+
+    data = json.loads(
+        (root / "config" / "server_log_filter" / "config.json").read_text(encoding="utf-8")
+    )
+    assert set(data) == slf_config_options(), "the config must still be completed"
+    assert data["announce_config_upgrade"] is False, "the switch itself must survive"
+
+
+# The same missing-comma mistake as BROKEN_CONFIG, with the notice switched off.
+# The switch has to survive into the raw text: the file is unparseable, so it is
+# the only place the plugin can read the admin's choice from.
+BROKEN_CONFIG_QUIET = BROKEN_CONFIG.replace(
+    "{\n", '{\n    "announce_broken_config": false,\n', 1
+)
+
+
+@pytest.fixture(scope="module")
+def broken_quiet_e2e_output(tmp_path_factory):
+    """One MCDR run whose broken config also turns the broken-config notice off."""
+    _require_mcdr()
+    root = tmp_path_factory.mktemp("mcdr_e2e_broken_quiet")
+    _build_instance(root, raw_plugin_config=BROKEN_CONFIG_QUIET)
+    return run_mcdr(root), root
+
+
+def test_broken_config_notice_is_silent_when_switched_off(broken_quiet_e2e_output):
+    output, _ = broken_quiet_e2e_output
+    assert "配置文件无法解析" not in output, "the notice was supposed to be silenced"
+    assert "已重置为默认配置" not in output
+
+
+def test_the_backup_still_happens_when_the_notice_is_off(broken_quiet_e2e_output):
+    """The switch silences the *message*, never the safety net."""
+    _, root = broken_quiet_e2e_output
+    backup = root / "config" / "server_log_filter" / "config.json.old"
+    assert backup.is_file(), "the broken file must be preserved regardless"
+    assert backup.read_text(encoding="utf-8") == BROKEN_CONFIG_QUIET
+
+
+def test_the_plugin_still_recovers_when_the_notice_is_off(broken_quiet_e2e_output):
+    output, root = broken_quiet_e2e_output
     assert "已启用 1 条日志过滤规则" in output, "it should fall back to the default rule"
     echoed = echoed_server_lines(output)
     assert [l for l in echoed if TARGET in l] == [], "filtering stopped working"

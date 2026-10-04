@@ -148,8 +148,24 @@ def repeat_streak_for_every_rule(src):
 def silence_upgrade_announcement(src):
     """不再报告配置里新增了哪些选项（升级悄悄发生）。"""
     return src.replace(
-        "    _announce_new_options(server)\n    return config",
-        "    return config  # mutation: upgrade not announced",
+        "    if config.announce_config_upgrade:\n        _announce_new_options(server)\n",
+        "    pass  # mutation: upgrade not announced\n",
+    )
+
+def ignore_the_upgrade_switch(src):
+    """无视 announce_config_upgrade —— 关了也照样播报。"""
+    return src.replace(
+        "    if config.announce_config_upgrade:\n",
+        "    if True:  # mutation: upgrade switch ignored\n",
+        1,
+    )
+
+def ignore_the_broken_config_switch(src):
+    """无视 announce_broken_config —— 关了也照样播报。"""
+    return src.replace(
+        "    if _raw_bool_option(raw, BROKEN_CONFIG_NOTICE_OPTION) is False:\n",
+        "    if False:  # mutation: broken-config switch ignored\n",
+        1,
     )
 
 def silence_reset_announcement(src):
@@ -186,8 +202,7 @@ def ignore_the_reset_guard(src):
 
 MUTATIONS = [
     ("idle-rule warning disabled", disable_warning,
-     ["tests/test_plugin.py", "-k", "idle or stale or streak"]),
-    ("threshold changed from >= to >", threshold_off_by_one,
+     ["tests/test_plugin.py", "-k", "idle or stale or streak"]),    ("threshold changed from >= to >", threshold_off_by_one,
      ["tests/test_plugin.py", "-k", "threshold or idle_rule"]),
     ("'session finished starting' guard removed", drop_startup_guard,
      ["tests/test_plugin.py", "-k", "never_reached_startup"]),
@@ -205,6 +220,10 @@ MUTATIONS = [
      ["tests/test_plugin.py", "-k", "has_a_description"]),
     ("upgrade announcement silenced", silence_upgrade_announcement,
      ["tests/test_plugin.py", "-k", "announcement or announcement_lists"]),
+    ("the upgrade switch ignored", ignore_the_upgrade_switch,
+     ["tests/test_plugin.py", "-k", "switch"]),
+    ("the broken-config switch ignored", ignore_the_broken_config_switch,
+     ["tests/test_plugin.py", "-k", "switch or leniently"]),
     ("broken config no longer quarantined", drop_quarantine_call,
      ["tests/test_plugin.py", "-k", "broken_config or quarantine or on_load_checks"]),
     ("problem detected but file not backed up", drop_backup_move,
@@ -253,7 +272,8 @@ def main():
                                      "never_reached_startup or catastrophic or migrator or "
                                      "no_comment_fields or has_a_description or "
                                      "generated_config_contains_only or prun or "
-                                     "rejected_by_the_safety_probe"])
+                                     "rejected_by_the_safety_probe or switch or "
+                                     "leniently or raw_bool"])
     print("baseline (unmutated): exit={} {}".format(code, summary))
     if code != 0:
         print("baseline is not green — fix the tests first")

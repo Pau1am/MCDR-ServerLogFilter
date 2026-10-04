@@ -75,7 +75,7 @@ python -m pip install --target .testlibs -r tests/requirements-test.txt
 PYTHONPATH=.testlibs python -m pytest tests -v     # Windows: $env:PYTHONPATH=".testlibs"
 ```
 
-当前 **156 个用例**，分三层：
+当前 **174 个用例**，分三层：
 
 | 层 | 位置 | 说明 |
 |---|---|---|
@@ -86,7 +86,7 @@ PYTHONPATH=.testlibs python -m pytest tests -v     # Windows: $env:PYTHONPATH=".
 另有两个工具：
 
 ```bash
-python tools/mutation_check.py    # 故意改坏实现，确认测试会变红（18 个变异，18/18 应被抓住）
+python tools/mutation_check.py    # 故意改坏实现，确认测试会变红（20 个变异，20/20 应被抓住）
 python benchmarks/bench_filter.py # 性能基准，README / CHANGELOG 里引用的数字都由它产出
 ```
 
@@ -119,9 +119,14 @@ python tools/mcdr_matrix.py --current
   可从配置关闭、`reset` 能清空、提醒内容不重复
 - **正则安全检查**：4 类灾难性回溯模式被拦下，8 种真实写法全部放行
 - **升级提示与迁移**：旧版本格式的配置在真实 MCDR 上自动补齐，并在日志里报告新增了哪些选项；
-  每个配置项都必须写明加入版本，且说明必须**紧挨在选项正上方一行**（均有测试保证）
+  每个配置项都必须写明加入版本与说明（有测试保证，漏写就会变红）
 - **坏配置保全**：解析失败时原文件被备份为 `config.json.old`，新配置以默认值重建，
   并在日志里给出原因与出错行列；空文件、顶层非对象同样处理
+- **三条提示的开关**（`announce_config_upgrade` / `announce_broken_config` /
+  `warn_about_stale_rules`，默认全开）：关掉只影响**说不说**，不影响**做不做**——
+  配置照补、坏文件照备份、统计照记。写坏配置时开关只能从**原文**里读（配置已解析失败），
+  因此大小写、空格、写在校验错误之前或之后都有效；「连备份都失败」属数据丢失警告，
+  不受开关影响。以上每条都有单测 + 真实 MCDR 端到端各验一遍
 
 ### 端到端（真实 MCDR + 假服务端，跑完整生命周期）
 
@@ -138,7 +143,7 @@ python tools/mcdr_matrix.py --current
 插件日志：
 
 ```
-插件 server_log_filter@1.1.0 已加载
+插件 server_log_filter@<版本> 已加载
 已启用 1 条日志过滤规则；命中后仅从 MCDR 控制台隐去，服务端日志不受影响
 本次运行共从 MCDR 控制台隐去 3 行服务端日志（服务端日志文件不受影响）
 ```
@@ -155,7 +160,8 @@ python tools/mcdr_matrix.py --current
 并且**真的没有出现在控制台上**，同时**事件仍然照常派发**。
 如果未来 MCDR 改变 `hidden()` 的语义，测试会直接失败，而不是让插件在服务器上静默出问题。
 
-端到端组共用一个 MCDR 实例（约 5～6 秒），可用 `MCDR_SKIP_E2E=1` 跳过。
+端到端组共有 6 次真实 MCDR 启动（正常一次、零命中提醒一次、坏配置一次、
+关掉写坏提示一次、删规则前后各一次），整个 `tests` 目录约 23 秒，可用 `MCDR_SKIP_E2E=1` 跳过。
 
 ## 环境要求的由来
 

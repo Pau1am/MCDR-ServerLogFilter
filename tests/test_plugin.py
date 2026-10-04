@@ -355,6 +355,8 @@ def test_config_defaults_match_documented_json():
     assert data["stale_rule_threshold"] == 3
     assert data["validate_patterns"] is True
     assert data["pattern_probe_timeout_ms"] == 25
+    assert data["announce_config_upgrade"] is True
+    assert data["announce_broken_config"] is True
 
 
 def test_config_deserializes_from_json_like_dict():
@@ -1335,6 +1337,7 @@ def test_migrator_reports_the_options_that_were_missing():
     assert slf._newly_added_options == [
         "log_matched_lines", "report_on_server_stop", "warn_about_stale_rules",
         "stale_rule_threshold", "validate_patterns", "pattern_probe_timeout_ms",
+        "announce_config_upgrade", "announce_broken_config",
     ]
 
 
@@ -1408,6 +1411,43 @@ def test_announcement_is_logged_exactly_once():
     server = FakePluginServer(config_data={"patterns": [LIVE]})
     slf.on_load(server, None)
     assert announce_output(server).count("配置已更新") == 1
+
+
+def test_upgrade_announcement_can_be_switched_off():
+    """``announce_config_upgrade = false`` silences the notice — and nothing else.
+
+    The switch governs the *speaking*, not the filling-in: MCDR still writes the
+    missing options into the file (that part is not ours to gate), the admin just
+    stops being told about it at every load.
+    """
+    server = FakePluginServer(
+        config_data={"patterns": [LIVE], "announce_config_upgrade": False}
+    )
+    slf.on_load(server, None)
+
+    assert "配置已更新" not in announce_output(server)
+    # the config still got completed — only the announcement is gone
+    assert set(slf._config.serialize()) == config_options()
+    assert slf._newly_added_options, "the missing options were still detected"
+
+
+def test_the_upgrade_switch_defaults_to_on():
+    server = FakePluginServer(config_data={"patterns": [LIVE]})
+    slf.on_load(server, None)
+    assert slf._config.announce_config_upgrade is True
+
+
+def test_the_upgrade_switch_survives_a_reload():
+    """Reloading with the switch off must stay quiet the second time too."""
+    config = {"patterns": [LIVE], "announce_config_upgrade": False}
+    server = start_plugin(config=config)
+    server.logger.infos.clear()
+
+    server.config_data = dict(config, validate_patterns=False)
+    slf._apply_config(server)
+
+    assert "配置已更新" not in announce_output(server)
+    assert slf._newly_added_options, "the reload should still have found new options"
 
 
 # ---------------------------------------------------------------------------
@@ -1571,3 +1611,80 @@ def test_quarantine_survives_an_unwritable_location(tmp_path, monkeypatch):
 
     assert reason is not None, "the problem is still reported"
     assert any("备份" in m for m in server.logger.errors)
+
+
+# ---------------------------------------------------------------------------
+#  12b. the notice switches for the broken-config path
+# ---------------------------------------------------------------------------
+
+def _broken_config_mentioning(line):
+    """``BROKEN_JSON`` with an extra line at the top — still unparseable.
+
+    The switch has to end up in the *raw text*: when the file cannot be parsed,
+    that text is the only place the admin's choice can be read from.
+    """
+    return BROKEN_JSON.replace("{\n", "{\n    " + line + "\n", 1)
+
+
+def test_the_broken_config_switch_is_a_real_option():
+    """Drift guard: the name the quarantine peeks for must exist on Config.
+
+    Renaming the field without renaming the constant would leave the switch
+    silently dead — it would be written to the file and never looked at.
+    """
+    assert slf.BROKEN_CONFIG_NOTICE_OPTION in slf.Config.get_field_annotations()
+
+
+def test_broken_config_notice_can_be_switched_off(tmp_path):
+    text = _broken_config_mentioning('"announce_broken_config": false,')
+    server, folder = server_with_config_file(tmp_path, text)
+
+    slf._quarantine_broken_config(server, slf.CONFIG_FILE_NAME)
+
+    assert server.logger.errors == [], "the notice was supposed to be silenced"
+    assert (folder / "config.json.old").is_file(), "the backup happens regardless"
+    assert not (folder / "config.json").exists()
+
+
+@pytest.mark.parametrize(
+    "line, announced",
+    [
+        ('"announce_broken_config": false,', False),
+        ('"announce_broken_config" :  false ,', False),   # layout is free-form
+        ('"announce_broken_config": FALSE,', False),      # a hand-written capital
+        ('"announce_broken_config": true,', True),
+        ('"announce_broken_config": "false",', True),     # a string is not a boolean
+        ('"announce_broken_configx": false,', True),      # a longer name is not a match
+        (None, True),                                     # absent -> default (on)
+    ],
+)
+def test_the_switch_is_read_leniently_from_the_raw_file(tmp_path, line, announced):
+    text = BROKEN_JSON if line is None else _broken_config_mentioning(line)
+    server, folder = server_with_config_file(tmp_path, text)
+
+    slf._quarantine_broken_config(server, slf.CONFIG_FILE_NAME)
+
+    assert bool(server.logger.errors) is announced, server.logger.errors
+    assert (folder / "config.json.old").is_file(), "the backup always happens"
+
+
+def test_raw_bool_option_finds_nothing_when_absent():
+    assert slf._raw_bool_option('{"a": true}', "b") is None
+
+
+def test_a_failed_backup_is_reported_even_with_the_notice_off(tmp_path, monkeypatch):
+    """Silencing a notice must not silence a *data-loss* error.
+
+    When the file cannot even be moved aside, MCDR is about to overwrite it in
+    place. That is not routine chatter, so it gets through the switch on purpose.
+    """
+    text = _broken_config_mentioning('"announce_broken_config": false,')
+    server, _ = server_with_config_file(tmp_path, text)
+
+    def boom(src, dst):
+        raise OSError("simulated")
+
+    monkeypatch.setattr(slf.os, "replace", boom)
+    slf._quarantine_broken_config(server, slf.CONFIG_FILE_NAME)
+
+    assert any("备份" in m for m in server.logger.errors), server.logger.errors
