@@ -1,7 +1,7 @@
 # 测试 / Tests
 
-本目录是 Server Log Filter 的测试套件。**175 个用例**，覆盖过滤行为、配置、
-命令面、发布打包、**真实 MCDR 端到端**，以及本插件最核心的安全属性
+本目录是 Server Log Filter 的测试套件。**208 个用例**，覆盖过滤行为、配置、
+命令面、发布打包、**真实 MCDR 端到端**、**多语言**，以及本插件最核心的安全属性
 （被隐去的行仍保留 `process`，事件照常分发）。
 
 > 打包、跨 MCDR 版本矩阵、变异检查等更广的开发话题见
@@ -34,8 +34,13 @@ $env:PYTHONPATH=".testlibs"; python -m pytest tests -v
 预期输出结尾：
 
 ```
-175 passed
+208 passed
 ```
+
+> **开发中不用每次都跑全量。** 改哪一块就只跑那一块，确认当前版本能过即可，例如
+> `pytest tests/test_plugin.py -k language -q` 或 `pytest tests/test_e2e.py -k auto -q`。
+> **全量套件 + 变异检查 + 跨版本矩阵留到提交 PR 前统一跑一次**，有问题集中修。
+> 报告中要如实区分「跑过」与「没跑」。
 
 ## 覆盖内容
 
@@ -54,8 +59,9 @@ $env:PYTHONPATH=".testlibs"; python -m pytest tests -v
 | **升级提示与迁移** | **15** | 见下；含**升级提示开关**本身的语义（关了不播、但配置照补） |
 | **坏配置的保全与重建** | **13** | 见下 |
 | **写坏提示的开关** | **11** | 开关从**写坏的原文**里读取（大小写 / 空格 / 位置随意、同名后缀不算、找不到按默认开启）；被静默的只有消息，备份照做；「连备份都失败」不受开关影响 |
-| **端到端（真实 MCDR）** | **26** | 见下 |
-| **合计** | **175** | |
+| **语言（i18n）** | **29** | 见下；`auto` 双向跟随、显式值压过 MCDR、宽松识别、未知语言回落、坏目录不崩、**打包后仍读得到文案**、英文真的到达每一处输出，外加一整套目录结构不变式 |
+| **端到端（真实 MCDR）** | **30** | 见下 |
+| **合计** | **208** | |
 
 > 计数含 `@pytest.mark.parametrize` 展开后的用例数，与 `pytest --collect-only` 一致。
 
@@ -85,6 +91,10 @@ $env:PYTHONPATH=".testlibs"; python -m pytest tests -v
 | `test_plugin_generated_its_default_config` | 首次运行生成 `config/server_log_filter/config.json`，字段与默认值正确 |
 | `test_a_deleted_rule_is_announced_as_cleaned_up` | **同一个实例目录跑两次 MCDR**，中间删掉一条规则；第二次启动时控制台出现「已清除」提示（这句只在载入阶段打印，因此能证明清理发生在重载那一刻） |
 | `test_a_deleted_rule_leaves_the_state_file` | 第二次运行后 `state.json` 里已无该规则，存活规则历史完好，`session_index == 2` |
+| `test_auto_follows_mcdr_language_end_to_end` | 实例**不写** `language` 键、MCDR 设为 `en_us` → 插件输出全英文（同时顺带走一遍 1.2.2 的升级提示，因为它也在英文里） |
+| `test_auto_follows_mcdr_into_chinese_too` | 实例**不写** `language` 键、MCDR 设为 `zh_cn` → 插件输出**中文**。这条专治一个易混点：`auto` 读的是 MCDR **当前**的 `language`，不是某个内置默认值（两个方向都测才能区分这两种实现） |
+| `test_an_explicit_language_beats_the_mcdr_setting_end_to_end` | MCDR 设为 `zh_cn`、插件写 `en_us` → 插件那几行仍是英文（MCDR 自己的界面文案按它自己的设置走，所以断言只盯插件输出的那几条） |
+| `test_the_packaged_plugin_carries_its_language_files` | 解开发布包，`lang/*.json` 在里面，且键集与源码目录一致 |
 
 **这不是空断言**：把插件从 `plugins/` 拿掉后重跑，目标行回显 2 次，第 1 条用例会失败。
 
@@ -137,8 +147,15 @@ if handler.test_server_startup_done(info):
 - `start_command` 里的解释器路径**要加引号**：路径含空格（如 `Paul LAM`）时，不加引号会被
   `cmd.exe` 截断成 `'C:\Users\Paul' is not recognized...`。
 
-端到端组共用一个 MCDR 实例（约 5～6 秒，仅启动一次 MCDR）；`MCDR_SKIP_E2E=1` 可跳过，
-缺少 `.testlibs` 时自动 skip。
+端到端组共用一个 MCDR 实例（约 5～6 秒，仅启动一次 MCDR）；但**与语言有关的四条
+必须单独起实例**（要换 MCDR 的 `language` 或插件的 `language`，配置不同），
+所以整组一共 10 次真实启动、约 29 秒。`MCDR_SKIP_E2E=1` 可跳过，缺少 `.testlibs` 时自动 skip。
+
+> **e2e 里插件的语言和 MCDR 的语言是分开设定的。** 实例的 MCDR 默认用 `en_us`，
+> 插件则单独 pin 成 `zh_cn`：如果让 MCDR 也说中文，它自己的界面文案会跟着变，
+> 而断言要扫的控制台里那些**英文标志行**（如 `Server process stopped with code 0`）就消失了
+> —— `grep` 过 MCDR 的语言文件，这个 key 只在 `en_us.yml` 里存在。
+> 要测「跟随」时把插件的 `plugin_language` 传 `None`，生成的配置里就不写 `language` 键。
 
 ## 发布打包的回归防护
 
@@ -148,9 +165,11 @@ if handler.test_server_startup_done(info):
   `PackedPlugin._check_dir_legality` 校验
 - `test_packager_excludes_repo_infrastructure` —— `conftest.py` / `pack.py` / `tests/` /
   `.testlibs/` / `__pycache__` 都不在包里
-- `test_packager_ships_exactly_the_allowlist` —— **把产物内容钉死为 4 个文件**
-  （`mcdreforged.plugin.json` / `server_log_filter/__init__.py` / `CHANGELOG.md` / `LICENSE`），
-  并断言两个 README **不在**包里。这样任何对白名单的改动都必须显式改测试，
+- `test_packager_ships_exactly_the_allowlist` —— **把产物内容钉死为 7 个文件**
+  （`mcdreforged.plugin.json` / `server_log_filter/__init__.py` / `i18n.py` /
+  `lang/en_us.json` / `lang/zh_cn.json` / `CHANGELOG.md` / `LICENSE`），
+  并断言三个 README（`README.md`、`README_en.md`、`lang/README.md`）**都不在**包里。
+  这样任何对白名单的改动都必须显式改测试，
   避免再出现「体积悄悄变了但没人知道」
 - `test_packager_keeps_artifact_small` —— 文件数 < 20 且 < 200 KiB
 - `test_packager_ships_submodules_recursively` —— 在临时副本里植入
@@ -168,7 +187,16 @@ if handler.test_server_startup_done(info):
 
 > 另一条同样隐蔽的坑：白名单如果写成 `rel.parent == Path(PACKAGE_NAME)`，就只收**直接子级**，
 > `server_log_filter/sub/helper.py` 这类嵌套子模块会被**静默丢弃**——打出一个缺文件的包，
-> 而且不报任何错。现在的实现用 `rel.parts[0]`，并有上面的用例守着。
+> 而且不报任何错。现在的实现用 `rel.parts[0]` + 「任意层级的 `.py`」+「`lang/` 下正好三层的
+> `.json`」，并有上面的用例守着。
+
+> 还有一条只有打包后才看得见的坑：**MCDR 是用 `zipimport` 从 `.mcdr` 里 import 插件的**，
+> 因此包内 `__file__` 指向压缩包内部，用 `open()` 读自带数据文件会失败。
+> 本插件的消息全部存在 `lang/*.json` 里，所以这个失败会让**所有输出退化成裸键名**
+> （控制台出现 `summary.rules_enabled` 这种字样），而开发机上完全正常。
+> `test_the_packed_plugin_can_still_read_its_catalogues` 在子进程里 import
+> **真实构建出来的 `.mcdr`** 并断言读到的是真句子，专门守这条；
+> `tools/mutation_check.py` 里也有对应变异（把 `pkgutil.get_data` 换成 `None`）。
 
 ## 零命中提醒（第 8 组）
 
@@ -259,6 +287,54 @@ JSON 很严格，手工加规则时漏一个逗号就会解析失败，而 MCDR 
 断言备份存在且逐字节一致、新配置可正常解析、控制台给出原因与行列号、
 并且**插件仍然正常工作**（回退到默认规则并继续过滤）。
 
+## 语言（第 13 组）
+
+所有面向用户的文案都住在 `server_log_filter/lang/<语言码>.json` 里，**一个语言一个文件**，
+扁平 `键 → 模板`。`language` 配置项的默认值是 `auto`，即跟随 MCDR 自己的语言设置；
+也可以写死成 `zh_cn` / `en_us`。
+
+解析链是「归一化 → 精确命中 → 兄弟语言 → 同基语言 → `en_us`」：
+
+| 情形 | 结果 |
+|---|---|
+| `auto` + MCDR 是 `zh_cn` | 中文（**不产生任何提示**——用户是把选择委托给了 MCDR） |
+| `auto` + MCDR 语言没出货（如 `fr_fr`） | 回落，**静默** |
+| 显式写 `zh_tw`（未出货） | 回落到 `zh_cn`，并**说一次** |
+| 显式写 `klingon` | 回落到 `en_us`，并**说一次** |
+| `EN_us` / `zh-CN` / `  en  ` / `zh` | 都能认出来 |
+
+几个设计上的取舍值得记下来：
+
+- **`auto` 静默、显式值才警告。** 前者是「我用 MCDR 的设置」，没出货不是用户的错；
+  后者是明确的错误输入，静默会让人以为设置生效了。
+- **翻译失败绝不抛异常。** 模板 `format()` 出问题（比如译文漏了占位符）时返回**原文**，
+  缺 key 时逐级回落，最后退化成键名——**日志插件的消息面不能成为新的故障点**。
+- **配置说明也走查表。** `CONFIG_DOC` 存的是**语言键**而不是中文句子，
+  于是「每个选项都有说明」这条不变式对**每一种语言**同时成立，说明文字也不会随语言漂移。
+- **坏配置那条路只能从文件原文读语言**（`_raw_str_option`），因为在那一刻配置尚未解析成功；
+  且内部用 `warn=False` 解析一次，避免同一条警告说两遍。
+
+目录结构的不变式一并守着，所以「加一门语言」不需要动代码、也不会漏翻：
+
+| 不变式 | 用例 |
+|---|---|
+| 每个出货的语言文件都能解析 | `test_every_shipped_language_file_loads` |
+| 键集与回落语言**完全一致** | `test_every_language_file_has_exactly_the_same_keys` |
+| 模板里的占位符集合一致 | `test_every_translation_keeps_the_placeholders` |
+| 代码里用到的键**全部存在** | `test_every_key_the_code_asks_for_exists_in_every_catalogue` |
+| **没有键是没人用的**（反向） | `test_no_catalogue_key_is_left_unused` |
+| `CONFIG_DOC` 的键 == `Config` 的字段 | `test_the_config_descriptions_are_exactly_the_options` |
+| `en_us` 里不含 CJK 字符 | `test_the_english_catalogue_is_actually_english` |
+
+> 前两条不变式靠 **AST** 实现：遍历源码里所有 `_t(...)` / `say(...)` / `translate(...)`
+> 调用的**第一个位置参数**、取字面量，得到「代码实际用到的键集合」，
+> 再与每份语言文件的键集双向比对。于是「新加了一处输出却忘了加文案」会直接变红，
+> 而不需要人工维护一份键名单——那种名单迟早会和代码脱节。
+
+> 「翻译有没有真的到达用户面前」另有一组用例逐处验证：零命中提醒、命令与运行摘要、
+> 删规则播报与规则报错、升级提示，都在英文下检查过。
+> 结构对了不等于接上了，这一课在第 9 组（灾难性回溯防护）已经吃过一次。
+
 判断一组测试有没有效，唯一可靠的办法是**故意把实现改坏，看测试会不会变红**。
 本套件的关键断言都经过这一步验证，可以直接复跑：
 
@@ -266,7 +342,14 @@ JSON 很严格，手工加规则时漏一个逗号就会解析失败，而 MCDR 
 python tools/mutation_check.py
 ```
 
-脚本会依次注入 20 个缺陷，要求相关用例变红；全绿即视为测试失效。已确认能被抓住的变异：
+脚本会依次注入 28 个缺陷，要求相关用例变红；全绿即视为测试失效。
+
+> **判定看 pytest 的退出码：只有 `exit == 1` 才算「被抓住」。** `4`（命令行用法错误）
+> 和 `5`（没收集到用例）都说明**脚本自己写错了**，不是测试变红——早期把 `4` 也当命中，
+> 因此拿到过一个假的满分。变异的目标不限于 `__init__.py`：条目形如
+> `(名字, 目标文件, 变换函数, baseline 选择器)`，可以打在 `i18n.py` 或语言 JSON 上。
+
+已确认能被抓住的变异：
 
 | 变异 | 抓住它的用例 |
 |---|---|
@@ -290,6 +373,14 @@ python tools/mutation_check.py
 | `!!logfilter reload` 不再清理已删除规则的统计 | `test_deleting_a_rule_prunes_its_state_on_the_reload_command` |
 | 孤立项按「编译成功的规则」而非配置原文判断 | `test_a_rule_rejected_by_the_safety_probe_keeps_its_history` |
 | 忽略「配置刚被自动重置」的保护 | `test_a_reset_config_does_not_wipe_the_rule_history` |
+| **无视 `language` 配置项** | `test_an_explicit_language_overrides_mcdr`、`test_the_language_switches_on_reload_without_a_restart` |
+| **无视 MCDR 的语言设置**（`auto` 失效） | `test_auto_follows_mcdr`、`test_auto_follows_mcdr_in_the_other_direction` |
+| **读不到语言文件**（`pkgutil.get_data` 恒返回 `None`） | `test_the_packed_plugin_can_still_read_its_catalogues` 等 |
+| 静默「语言不存在」的警告 | `test_an_unknown_language_falls_back_and_says_so` |
+| 静默「语言文件读不出来」的警告 | `test_a_broken_catalogue_falls_back_and_is_reported` |
+| 坏配置时不从**原文**读语言 | `test_the_broken_config_notice_uses_the_language_from_the_raw_file` |
+| **中文语言文件少一个键** | `test_every_language_file_has_exactly_the_same_keys` 等 |
+| **某个模板少一个占位符** | `test_every_translation_keeps_the_placeholders` |
 
 > 教训留在这里：本套件的端到端组**曾经**声称能挡住 `hidden()` → `discarded()` 的回归，
 > 实测 6 条用例全部漏过，只有 2 条单元用例抓到。现在那条属性由
@@ -342,10 +433,15 @@ python tools/mcdr_matrix.py --current
 | 提醒内容（规则名 / 连续次数 / 从未命中过） | ✅ | ✅ | ✅ |
 | `state.json` 写入、`session_index` 与 streak 正确推进 | ✅ | ✅ | ✅ |
 | 无关日志行未被误伤 | ✅ | ✅ | ✅ |
+| **`auto` 跟随 MCDR 语言（控制台全中文）** | ✅ | ✅ | ✅ |
 | 运行时异常 | 0 | 0 | 0 |
 
-**12 项检查在三个版本上逐项一致。** 2.13.0 / 2.14.1 仍按设计被 MCDR 依赖检查拦下
+**14 项检查在三个版本上逐项一致。** 2.13.0 / 2.14.1 仍按设计被 MCDR 依赖检查拦下
 （提示「不满足版本约束 >=2.15.0」）。
+
+> 语言那一行的判定叫 `spoke_chinese`：矩阵生成的配置首位写 `"language": "auto"`，
+> 而矩阵实例的 MCDR 固定为 `language: zh_cn`，于是「输出里没有出现英文句子」一次
+> 同时证明了两件事——插件确实读到了 MCDR 的语言设置，且 `auto` 就是**默认行为**。
 
 另经逐版本 API 检查确认：新增功能用到的 `save_config_simple`、带 `file_name` 的
 `load_config_simple`、嵌套 `Serializable`、`on_server_startup` 自 **2.13.0** 起均可用，

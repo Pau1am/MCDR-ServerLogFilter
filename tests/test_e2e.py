@@ -21,6 +21,7 @@ import os
 import subprocess
 import sys
 import time
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -100,6 +101,10 @@ handler: vanilla_handler
 handler_detection: false
 start_command: '"{python}" fake_server.py'
 working_directory: server
+# The plugin's ``language`` defaults to ``auto``, i.e. "whatever MCDR uses". Pinning
+# MCDR to zh_cn is therefore what makes the Chinese assertions below meaningful: they
+# are also the end-to-end proof that ``auto`` really follows this setting.
+language: {language}
 advanced_console: false
 disable_console_thread: true
 disable_console_color: true
@@ -127,11 +132,21 @@ def _build_instance(
     plugin_config: dict = None,
     state: dict = None,
     raw_plugin_config: str = None,
+    mcdr_language: str = "en_us",
+    plugin_language: str = "zh_cn",
 ) -> Path:
     """Create an MCDR instance in ``root`` that loads the packaged plugin.
 
     ``raw_plugin_config`` writes the file verbatim instead of json-dumping a dict —
     the only way to produce a deliberately malformed config.
+
+    The two languages are separate on purpose:
+
+    * ``mcdr_language`` is MCDR's own setting. It is left at MCDR's default (``en_us``)
+      so that MCDR's *own* console wording stays out of what these tests assert.
+    * ``plugin_language`` is written into the plugin's config, pinning what the plugin
+      speaks. ``None`` omits the key altogether, which puts the plugin on its documented
+      default (``auto`` = follow MCDR) — what the language tests below need.
     """
     (root / "server").mkdir(parents=True)
     (root / "plugins").mkdir()
@@ -142,7 +157,7 @@ def _build_instance(
         FAKE_SERVER_SOURCE.format(lines=FAKE_SERVER_LIFECYCLE), encoding="utf-8"
     )
     (root / "config.yml").write_text(
-        MCDR_CONFIG.format(python=sys.executable), encoding="utf-8"
+        MCDR_CONFIG.format(python=sys.executable, language=mcdr_language), encoding="utf-8"
     )
     (root / "permission.yml").write_text("{}\n", encoding="utf-8")
     (root / "plugins" / "e2e_startup_probe.py").write_text(
@@ -161,6 +176,8 @@ def _build_instance(
             "log_matched_lines": False,
             "report_on_server_stop": True,
         }
+        if plugin_language is not None:
+            cfg["language"] = plugin_language
         if plugin_config:
             cfg.update(plugin_config)
         config_text = json.dumps(cfg, indent=2)
@@ -323,11 +340,12 @@ def test_packaged_plugin_is_what_was_loaded(e2e_output):
 
 
 def test_legacy_config_is_upgraded_in_place(e2e_output):
-    """A config file written by an older version gains the new options.
+    """A config file written by an older version gains the newest options.
 
-    ``_build_instance`` seeds only the three options that existed in 1.0.x, so this
-    run exercises the real upgrade path: MCDR fills in the missing options from
-    their defaults and writes the file back, and the plugin says so in the log.
+    ``_build_instance`` seeds only the three options that existed in 1.0.x, plus the
+    ``language`` the harness pins, so this run exercises the real upgrade path: MCDR
+    fills in the missing options from their defaults and writes the file back, and the
+    plugin says so in the log.
     """
     _, root = e2e_output
     cfg = root / "config" / "server_log_filter" / "config.json"
@@ -335,6 +353,7 @@ def test_legacy_config_is_upgraded_in_place(e2e_output):
 
     data = json.loads(cfg.read_text(encoding="utf-8"))
     assert set(data) == {
+        "language",
         "patterns",
         "log_matched_lines",
         "report_on_server_stop",
@@ -391,6 +410,9 @@ def test_upgrade_is_announced_with_versions(e2e_output):
         assert name in output, "new option {} was not listed".format(name)
     assert "v1.1.0 加入" in output
     assert "v1.2.1 加入" in output
+    # `language` is deliberately not in this list: the harness seeds it (see
+    # _build_instance). The 1.2.2 upgrade path is covered by
+    # test_auto_follows_mcdr_language_end_to_end, whose config omits it.
 
 
 def test_plugin_keeps_its_state_file_out_of_the_user_config(e2e_output):
@@ -524,7 +546,13 @@ def test_state_file_advances_by_one_session(stale_e2e_output):
 
 # The mistake this guards against: hand-adding a rule to the array and dropping
 # the comma. MCDR's "regen" policy would then replace the whole file with defaults.
+#
+# ``language`` is present so the notices come out in a language these tests assert on.
+# It has to be *in this text*: once the file is unparseable, its own bytes are the only
+# place the plugin can read the admin's language from — the same trick the notice switch
+# relies on.
 BROKEN_CONFIG = """{
+    "language": "zh_cn",
     "patterns": [
         "standing on air - force-sending blocks below"
         "my-own-handwritten-rule"
@@ -698,3 +726,95 @@ def test_a_deleted_rule_leaves_the_state_file(pruned_e2e_output):
     # both runs completed, so the config really was healthy — the rule was not
     # dropped because of some unrelated failure
     assert state["session_index"] == 2
+
+
+# ---------------------------------------------------------------------------
+#  language: proven on a real MCDR, not just against the fake server
+# ---------------------------------------------------------------------------
+
+def test_auto_follows_mcdr_language_end_to_end(tmp_path_factory):
+    """MCDR set to en_us must make the plugin speak English, with no config at all.
+
+    ``language`` is omitted from the seeded config, so this exercises exactly the
+    documented default (``auto``) against a real MCDR process — the one thing the
+    fake-server tests cannot prove, since they stub ``get_mcdr_language()`` out. It is
+    also the only run where ``language`` counts as a missing option, so it doubles as
+    the end-to-end check of the 1.2.2 upgrade notice.
+    """
+    _require_mcdr()
+    root = tmp_path_factory.mktemp("mcdr_e2e_en")
+    _build_instance(root, mcdr_language="en_us", plugin_language=None)
+    output = run_mcdr(root)
+
+    assert "Enabled 2 log filter rule(s)" in output, output[-3000:]
+    assert "Config updated" in output
+    assert "added in v1.2.2" in output
+    assert "Hidden 3 server log line(s)" in output, "the end-of-run summary must be English too"
+
+    # and the plugin's own messages came out in English, not Chinese
+    for chinese in ("已启用", "配置已更新", "隐去", "加入"):
+        assert chinese not in output, "untranslated output: {}".format(chinese)
+
+
+def test_auto_follows_mcdr_into_chinese_too(tmp_path_factory):
+    """An admin who set MCDR to ``zh_cn`` gets Chinese notices, still without a config.
+
+    This is the direction that matters in practice and the one a reader could misread:
+    ``auto`` follows MCDR's *current* ``language`` setting from ``config.yml`` — it is
+    not "the plugin's default language". Setting MCDR to Chinese therefore has to be
+    enough on its own.
+
+    MCDR's own console lines are Chinese in this instance, which is fine: the assertions
+    look at the plugin's messages only.
+    """
+    _require_mcdr()
+    root = tmp_path_factory.mktemp("mcdr_e2e_auto_zh")
+    _build_instance(root, mcdr_language="zh_cn", plugin_language=None)
+    output = run_mcdr(root)
+
+    assert "已启用 2 条日志过滤规则" in output, output[-3000:]
+    assert "隐去" in output, "the end-of-run summary must be Chinese too"
+
+    # ...and nothing came out in English, i.e. auto really read config.yml
+    for english in ("Enabled 2 log filter rule(s)", "Hidden 3 server log line(s)"):
+        assert english not in output, "auto did not follow MCDR: {!r} present".format(english)
+
+
+def test_an_explicit_language_beats_the_mcdr_setting_end_to_end(tmp_path_factory):
+    """MCDR in Chinese, plugin pinned to English: the plugin's own option wins.
+
+    MCDR's own messages are Chinese here (that is what it was told to speak), so the
+    assertion is about the plugin's lines specifically.
+    """
+    _require_mcdr()
+    root = tmp_path_factory.mktemp("mcdr_e2e_zh")
+    _build_instance(root, mcdr_language="zh_cn", plugin_language="en_us")
+    output = run_mcdr(root)
+
+    assert "Enabled 2 log filter rule(s)" in output, output[-3000:]
+    assert "已启用 2 条日志过滤规则" not in output
+
+
+def test_the_packaged_plugin_carries_its_language_files(tmp_path_factory):
+    """A release without the catalogues would show raw keys to every user.
+
+    The unit suite already asserts the packer's file list; this one checks the
+    *loaded* artifact, which is what actually reaches an admin.
+    """
+    _require_mcdr()
+    root = tmp_path_factory.mktemp("mcdr_e2e_catalogues")
+    _build_instance(root)
+    artifact = root / "plugins" / "ServerLogFilter.mcdr"
+
+    with zipfile.ZipFile(artifact) as archive:
+        names = archive.namelist()
+        assert "server_log_filter/lang/zh_cn.json" in names, names
+        assert "server_log_filter/lang/en_us.json" in names, names
+        keys = {
+            language: set(json.loads(archive.read(name).decode("utf-8")))
+            for language, name in (
+                ("zh_cn", "server_log_filter/lang/zh_cn.json"),
+                ("en_us", "server_log_filter/lang/en_us.json"),
+            )
+        }
+    assert keys["zh_cn"] == keys["en_us"], "the shipped catalogues disagree"
