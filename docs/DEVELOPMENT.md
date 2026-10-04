@@ -22,7 +22,7 @@ MCDR-ServerLogFilter/
 ├── mcdreforged.plugin.json    插件元数据
 ├── server_log_filter/         代码子包（与插件 id 同名）
 │   └── __init__.py
-├── CHANGELOG.md               变更记录（随发布包分发）
+├── CHANGELOG.md               变更记录，只留最新一版（随发布包分发）
 ├── LICENSE
 ├── README.md / README_en.md   主文档，面向使用者（不打包）
 ├── docs/DEVELOPMENT.md        本文件（不打包）
@@ -46,10 +46,15 @@ python pack.py            # 生成 ServerLogFilter-v<版本号>.mcdr
 |---|---|
 | `mcdreforged.plugin.json` | 插件元数据（必需） |
 | `server_log_filter/__init__.py` | 插件代码 |
-| `CHANGELOG.md` | 变更记录，随包分发 |
+| `CHANGELOG.md` | 变更记录，**只含最新一个版本**，随包分发 |
 | `LICENSE` | MIT 许可证 |
 
 两个 README **不打包**：MCDR 从不读取它们，内容与 Releases 页面重复，而去掉后产物体积几乎减半。
+
+> **`CHANGELOG.md` 只保留最新版本一节**，旧条目在发新版本时删掉（全文留在 Releases 页面上）。
+> 它与包一起分发，任何一个历史条目都会**永久**占着用户的体积——实测 1.2.0 → 1.2.1
+> 涨的 10.3% 全部来自它自己变长。`test_changelog_keeps_only_the_latest_release`
+> 钉住这一点：必须恰好只有一节，且版本号等于 `mcdreforged.plugin.json` 里的当前版本。
 
 > **为什么必须用白名单？** 早期版本的这一节用的是 `rglob("*")` 加一个很短的 `skip` 列表，
 > 那是**黑名单**思路，会被仓库里任何新文件悄悄带进发布包。两个具体后果：
@@ -201,7 +206,8 @@ Minecraft 侧：过滤发生在 MCDR 侧（对服务端 stdout 逐行匹配）�
 ## 发布流程
 
 1. 改动合入 `main`（对外动作前先征得维护者同意）
-2. 更新 `CHANGELOG.md` 与 `mcdreforged.plugin.json` 里的版本号
+2. 更新 `CHANGELOG.md` 与 `mcdreforged.plugin.json` 里的版本号；
+   同时**把 `CHANGELOG.md` 裁成只剩本次版本一节**（旧条目删除，Releases 里已有全文）
 3. 判定是否属于**实质更新**：只有用户拿到的东西变了（插件行为 / 配置项 / 命令 / 兼容性）
    才发新版本；纯测试、纯文档、纯打包脚本改动不发版本
 4. `python pack.py` 构建产物，并记下**该文件**的 SHA256

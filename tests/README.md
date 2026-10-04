@@ -1,6 +1,6 @@
 # 测试 / Tests
 
-本目录是 Server Log Filter 的测试套件。**174 个用例**，覆盖过滤行为、配置、
+本目录是 Server Log Filter 的测试套件。**175 个用例**，覆盖过滤行为、配置、
 命令面、发布打包、**真实 MCDR 端到端**，以及本插件最核心的安全属性
 （被隐去的行仍保留 `process`，事件照常分发）。
 
@@ -34,7 +34,7 @@ $env:PYTHONPATH=".testlibs"; python -m pytest tests -v
 预期输出结尾：
 
 ```
-174 passed
+175 passed
 ```
 
 ## 覆盖内容
@@ -47,7 +47,7 @@ $env:PYTHONPATH=".testlibs"; python -m pytest tests -v
 | 配置对象 | 3 | 默认值与 README 文档一致；JSON 反序列化；往返稳定 |
 | MCDR 契约 | 2 | `InfoActionFlag.hidden()` 的常量构成；`InfoFilter` 允许改写 `action_flag` |
 | 命令面与元数据 | 8 | `on_load` 注册项；状态/测试/重载命令输出；`reload` 的 ADMIN 权限门禁；插件元数据与 `MIN_MCDR_VERSION` 同步 |
-| 发布打包 | 6 | 见下 |
+| 发布打包 | 7 | 见下 |
 | **零命中提醒** | **22** | 阈值语义、命中归零、启动失败不计入、热重载不误判、可关闭、`reset`、历史持久化、**以及「不重复输出」**，见下；另含**删除规则后统计立刻清除**（重载 / 命令两条路径、不写多余文件、不误删被拦下的规则、配置被重置时不动） |
 | **灾难性回溯防护** | **21** | 8 种真实写法全部放行；4 类危险模式被拦下；开关与超时可配置且**确实接在 `on_load` 上** |
 | **轻量化不变量** | **6** | 热路径的结构性断言（缓存 `hidden()`、无规则短路、命中即停），外加两条宽松的耗时护栏 |
@@ -55,7 +55,7 @@ $env:PYTHONPATH=".testlibs"; python -m pytest tests -v
 | **坏配置的保全与重建** | **13** | 见下 |
 | **写坏提示的开关** | **11** | 开关从**写坏的原文**里读取（大小写 / 空格 / 位置随意、同名后缀不算、找不到按默认开启）；被静默的只有消息，备份照做；「连备份都失败」不受开关影响 |
 | **端到端（真实 MCDR）** | **26** | 见下 |
-| **合计** | **174** | |
+| **合计** | **175** | |
 
 > 计数含 `@pytest.mark.parametrize` 展开后的用例数，与 `pytest --collect-only` 一致。
 
@@ -142,7 +142,7 @@ if handler.test_server_startup_done(info):
 
 ## 发布打包的回归防护
 
-`pack.py` 是仓库唯一的打包器，它的产物由这里 6 个用例把关：
+`pack.py` 是仓库唯一的打包器，它的产物由这里 7 个用例把关：
 
 - `test_packaged_artifact_is_loadable` —— 跑一遍 `pack.py`，把产物交给 **MCDR 自己的**
   `PackedPlugin._check_dir_legality` 校验
@@ -157,6 +157,9 @@ if handler.test_server_startup_done(info):
   `server_log_filter/sub/helper.py`，断言它**确实被打了进去**
 - `test_packager_root_entries_would_be_illegal_if_denylisted` —— 用真实的黑名单产物断言
   MCDR **确实会拒绝**它，防止有人把 `pack.py` "简化"回黑名单写法
+- `test_changelog_keeps_only_the_latest_release` —— `CHANGELOG.md` **恰好只有一节**，
+  且版本号等于 `mcdreforged.plugin.json` 里的当前版本（不含旧版本的链接定义）。
+  它随包分发，历史条目会永久占着用户的体积，所以旧条目在发新版时必须删掉
 
 这一节存在的直接原因：本测试套件自己的 `conftest.py` 位于仓库根目录，而 MCDR 禁止 `.mcdr`
 包含根级模块。如果打包器用 `rglob("*")` 加简短的排除列表（README 早期写法），产物会以

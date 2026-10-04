@@ -385,12 +385,12 @@ def test_upgrade_is_announced_with_versions(e2e_output):
         ("stale_rule_threshold", "1.1.0"),
         ("validate_patterns", "1.1.0"),
         ("pattern_probe_timeout_ms", "1.1.0"),
-        ("announce_config_upgrade", "1.3.0"),
-        ("announce_broken_config", "1.3.0"),
+        ("announce_config_upgrade", "1.2.1"),
+        ("announce_broken_config", "1.2.1"),
     ):
         assert name in output, "new option {} was not listed".format(name)
     assert "v1.1.0 加入" in output
-    assert "v1.3.0 加入" in output
+    assert "v1.2.1 加入" in output
 
 
 def test_plugin_keeps_its_state_file_out_of_the_user_config(e2e_output):

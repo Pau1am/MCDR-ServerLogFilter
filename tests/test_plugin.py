@@ -613,6 +613,33 @@ def test_packager_ships_exactly_the_allowlist(tmp_path):
         assert excluded not in names, "{} must not be shipped".format(excluded)
 
 
+def test_changelog_keeps_only_the_latest_release():
+    """The shipped changelog must not accumulate one section per release.
+
+    CHANGELOG.md travels inside the artifact, so every past entry keeps costing
+    users bytes forever -- 1.2.0 -> 1.2.1 was +10.3%, all of it the changelog
+    growing. Only the newest entry belongs there; the full history stays on the
+    Releases page, where it has already been published.
+
+    Asserting the single heading *equals the current version* is what makes this
+    a real constraint: "at most one heading" is satisfied by an empty file too.
+    """
+    root = pathlib.Path(__file__).resolve().parent.parent
+    changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    meta = json.loads((root / "mcdreforged.plugin.json").read_text(encoding="utf-8"))
+
+    headings = re.findall(r"^## \[([^\]]+)\]", changelog, re.M)
+    assert headings == [meta["version"]], (
+        "CHANGELOG.md should document exactly the shipped version ({}), found {}".format(
+            meta["version"], headings
+        )
+    )
+
+    # no leftover link-reference definitions for the removed versions either
+    leftovers = re.findall(r"^\[\d+\.\d+\.\d+\]:", changelog, re.M)
+    assert leftovers == [], "stale version links left behind: {}".format(leftovers)
+
+
 def test_packager_keeps_artifact_small(tmp_path):
     """A stray .testlibs/ once blew this up to 1362 files / 7.11 MB."""
     out, names = _build_package(tmp_path)
