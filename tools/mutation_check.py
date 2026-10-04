@@ -26,6 +26,7 @@ SRC = "server_log_filter/__init__.py"
 I18N = "server_log_filter/i18n.py"
 LANG_ZH = "server_log_filter/lang/zh_cn.json"
 LANG_EN = "server_log_filter/lang/en_us.json"
+PACK = "pack.py"
 
 WARN_BLOCK = """    if (
         not _config.warn_about_stale_rules
@@ -317,6 +318,112 @@ def narrow_the_format_catch(src):
     )
 
 
+def bare_command_shows_status_again(src):
+    """裸命令又回到状态页 —— 「命令打错了」和「我要看状态」再次得到同一个回应。"""
+    return src.replace(
+        "        .runs(_show_help)\n",
+        "        .runs(_show_status)  # mutation\n",
+    )
+
+
+def drop_the_command_alias(src):
+    """!!lf 别名被去掉（只剩一种拼法）。"""
+    return src.replace(
+        "ROOT_LITERALS = (COMMAND, COMMAND_ALIAS)\n",
+        "ROOT_LITERALS = (COMMAND,)  # mutation\n",
+    )
+
+
+def open_everything_up(src):
+    """权限门形同虚设：任何玩家都能看到规则与日志内容。"""
+    return src.replace(
+        "    return source.has_permission(PermissionLevel.ADMIN)\n",
+        "    return True  # mutation\n",
+    )
+
+
+def drop_the_click_events(src):
+    """帮助行不再可点（游戏内点了没反应）。"""
+    return src.replace(
+        "        RText(command, RColor.aqua).set_click_event(action, click),\n",
+        "        RText(command, RColor.aqua),  # mutation\n",
+    )
+
+
+def drop_the_permission_denial_explanation(src):
+    """权限被拒时又只剩默认的「权限不足」——玩家会以为「我明明是 OP 啊」。"""
+    return src.replace(
+        "        .requires(_admin_only, _admin_denied_message)\n",
+        "        .requires(_admin_only)  # mutation\n",
+    )
+
+
+def drop_the_version_from_the_title(src):
+    """顶栏不再显示版本号。"""
+    return src.replace(
+        "    if version:\n"
+        "        line.append(RText(\" v\" + version, RColor.yellow))\n",
+        "    if False:  # mutation\n"
+        "        line.append(RText(\" v\" + version, RColor.yellow))\n",
+    )
+
+
+def break_the_help_alignment(src):
+    """帮助行不再补空格 —— 说明文字会跟着子命令长短左右乱跳。"""
+    return src.replace(
+        '    padding = " " * (_HELP_COMMAND_WIDTH - len(command))\n',
+        '    padding = ""  # mutation\n',
+    )
+
+
+def bring_back_dark_text(src):
+    """重新用上 dark_gray —— 深色终端上几乎看不见。"""
+    return src.replace(
+        '        RText(description, RColor.white),\n',
+        '        RText(description, RColor.dark_gray),  # mutation\n',
+    )
+
+
+def drop_the_status_row_separator(src):
+    """状态页的规则行不再有 ``--`` —— 与帮助页的形状就不一致了。"""
+    return src.replace(
+        '        parts.append(RText("-- ", RColor.gray))\n',
+        '        parts.append(RText("", RColor.gray))  # mutation\n',
+    )
+
+
+def status_labels_lose_their_colour(src):
+    """状态页的标签退回 gray —— 又和帮助页的 aqua 分成两套。"""
+    return src.replace(
+        '    return RTextList(RText(label, RColor.aqua), RText(value, value_colour))\n',
+        '    return RTextList(RText(label, RColor.gray), RText(value, value_colour))  # mutation\n',
+    )
+
+
+def always_pad_the_rule_index(src):
+    """编号永远补到两位 —— 9 条以内会出现 ``[ 1]`` 这种多余空格。"""
+    return src.replace(
+        "    index_width = len(str(len(rules)))\n",
+        "    index_width = 2  # mutation\n",
+    )
+
+
+def ship_the_code_with_its_comments(src):
+    """打包时不再剥注释 —— 包又变回「仓库什么样就发什么样」。"""
+    return src.replace(
+        "                zf.writestr(rel, packaged_source(path))\n",
+        "                zf.writestr(rel, path.read_bytes())  # mutation\n",
+    )
+
+
+def strip_without_keeping_line_numbers(src):
+    """剥注释时整行删掉而不是留空 —— 包内行号与仓库对不上，堆栈会指错行。"""
+    return src.replace(
+        "            lines[row - 1] = line[:col].rstrip() + newline\n",
+        '            lines[row - 1] = ""  # mutation: shift line numbers\n',
+    )
+
+
 # (名称, 被改的文件, 改法, pytest 选择器)
 MUTATIONS = [
     ("idle-rule warning disabled", SRC, disable_warning,
@@ -387,6 +494,33 @@ MUTATIONS = [
      ["tests/test_plugin.py", "-k", "overflows_is_skipped or deeply_nested_is_skipped"]),
     ("the format catch narrowed again", I18N, narrow_the_format_catch,
      ["tests/test_plugin.py", "-k", "bad_attribute_is_returned"]),
+    ("the bare command wired back to the status screen", SRC, bare_command_shows_status_again,
+     ["tests/test_plugin.py", "-k", "bare_command_is_wired_to_the_help_screen"]),
+    ("the !!lf alias dropped", SRC, drop_the_command_alias,
+     ["tests/test_plugin.py", "-k", "both_spellings"]),
+    ("the admin gate opened up", SRC, open_everything_up,
+     ["tests/test_plugin.py", "-k", "open_to_players"]),
+    ("the help lines made unclickable", SRC, drop_the_click_events,
+     ["tests/test_plugin.py", "-k", "clickable"]),
+    ("the permission denial explanation dropped", SRC,
+     drop_the_permission_denial_explanation,
+     ["tests/test_plugin.py", "-k", "not_vanilla_op"]),
+    ("the version dropped from the title bar", SRC, drop_the_version_from_the_title,
+     ["tests/test_plugin.py", "-k", "names_the_plugin_and_the_version or different_colour"]),
+    ("the help rows no longer aligned", SRC, break_the_help_alignment,
+     ["tests/test_plugin.py", "-k", "aligned_in_one_column"]),
+    ("dark text brought back", SRC, bring_back_dark_text,
+     ["tests/test_plugin.py", "-k", "no_dark_text"]),
+    ("the status rows lost their separator", SRC, drop_the_status_row_separator,
+     ["tests/test_plugin.py", "-k", "status_rule_rows_have_the_same_separator"]),
+    ("the status labels lost their colour", SRC, status_labels_lose_their_colour,
+     ["tests/test_plugin.py", "-k", "same_palette_as_help"]),
+    ("the rule index always padded", SRC, always_pad_the_rule_index,
+     ["tests/test_plugin.py", "-k", "single_digit_rule_index"]),
+    ("comments shipped in the package again", PACK, ship_the_code_with_its_comments,
+     ["tests/test_plugin.py", "-k", "carries_no_comments"]),
+    ("stripping that shifts line numbers", PACK, strip_without_keeping_line_numbers,
+     ["tests/test_plugin.py", "-k", "keeps_line_numbers"]),
 ]
 
 def pytest_ok(workdir, selector):

@@ -10,6 +10,7 @@
 2. ``filter_server_info`` 跑在 MCDR 主线程，只做「按顺序短路匹配」，别加额外开销。
 3. 任何一条消息都不允许因为配置或语言文件写坏而抛异常。
 4. 文案一律走 ``_t()``（见 lang/<语言代码>.json），代码里不写死面向用户的句子。
+5. 界面里**不用 dark_gray / black**：管理员多半在深色终端上看，深色字看不清。
 
 需要 MCDR >= 2.15.0：``InfoActionFlag`` 自该版本引入；更低版本打一条错误并停用。
 """
@@ -22,7 +23,7 @@ import time
 from typing import Dict, List, Optional, Pattern, Tuple
 
 from mcdreforged.api.command import GreedyText, Literal
-from mcdreforged.api.rtext import RColor, RText, RTextList
+from mcdreforged.api.rtext import RAction, RColor, RText, RTextList
 from mcdreforged.api.types import (
     InfoFilter,
     PermissionLevel,
@@ -41,6 +42,19 @@ MIN_MCDR_VERSION = "2.15.0"
 STATE_FILE_NAME = "state.json"      # 命中历史；与用户的 config.json 分开
 CONFIG_FILE_NAME = "config.json"
 CONFIG_BACKUP_SUFFIX = ".old"       # 配置写坏时的备份后缀
+
+COMMAND = "!!logfilter"
+COMMAND_ALIAS = "!!lf"
+# 两种写法是**同一个 Literal 节点的两条字面量**（MCDR 的 Literal 接受一组），
+# 而不是两棵复制出来的命令树——后者迟早会漂移成两种行为。
+ROOT_LITERALS = (COMMAND, COMMAND_ALIAS)
+
+# 帮助页每行 ``!!lf <子命令>`` 要排在同一列，所以左边一栏按**最长的子命令**留宽。
+# 用常量算出来而不是写死数字：以后加子命令，对齐自动跟着走。
+# 元数据读不到名字时的兜底（真机上不会发生）。
+_PLUGIN_NAME_FALLBACK = "Server Log Filter"
+_TITLE_WIDTH = 53          # MC 聊天窗口默认字体下大约一行
+_TITLE_BAR_MIN = 4
 
 # 提示里显示的可读路径；由本文件所在目录名推导，不会与插件 id 漂移。
 _CONFIG_FOLDER_DISPLAY = "config/{}".format(os.path.basename(os.path.dirname(os.path.abspath(__file__))))
@@ -830,21 +844,18 @@ def on_load(server: PluginServerInterface, prev_module) -> None:
     # 必须在 on_load 注册；卸载时 MCDR 会自动移除，无需反注册。
     server.register_info_filter(_log_filter)
 
-    server.register_help_message("!!logfilter", _t("help.logfilter"))
+    # 两种拼法都登记进 MCDR 的 !!help，用户不用猜哪个是「正式」写法。
+    for prefix in ROOT_LITERALS:
+        server.register_help_message(prefix, _t("help.logfilter"))
+    # 权限要求只挂在这里一处，覆盖下面所有分支（见 _admin_only）。
     server.register_command(
-        Literal("!!logfilter")
-        .runs(_show_status)
+        Literal(ROOT_LITERALS)
+        .requires(_admin_only, _admin_denied_message)
+        .runs(_show_help)
+        .then(Literal("help").runs(_show_help))
         .then(Literal("list").runs(_show_status))
-        .then(
-            Literal("reload")
-            .requires(lambda src: src.has_permission(PermissionLevel.ADMIN))
-            .runs(_reload)
-        )
-        .then(
-            Literal("reset")
-            .requires(lambda src: src.has_permission(PermissionLevel.ADMIN))
-            .runs(_reset_streaks)
-        )
+        .then(Literal("reload").runs(_reload))
+        .then(Literal("reset").runs(_reset_streaks))
         .then(Literal("test").then(GreedyText("text").runs(_test_line)))
     )
 
@@ -926,6 +937,135 @@ def on_server_stop(server: PluginServerInterface, server_return_code: int) -> No
 # --------------------------------------------------------------------------
 
 
+def _admin_only(source) -> bool:
+    """整个命令面都限管理员：状态页会印出你写的规则，`test` 会验证日志内容。
+
+    要求只写在**根节点**上。MCDR 在解析路径上对每个节点都跑一遍 requirement，
+    所以根上一个就门住了全部子命令；在五个子命令上各写一遍是重复的声明，
+    迟早会漏掉一个（新增子命令时最容易忘）。
+    """
+    return source.has_permission(PermissionLevel.ADMIN)
+
+
+_HELP_SUBCOMMANDS = ("help", "list", "test", "reload", "reset")
+_HELP_COMMAND_WIDTH = len(COMMAND_ALIAS) + 1 + max(len(s) for s in _HELP_SUBCOMMANDS)
+
+
+def _plugin_title(server) -> Tuple[str, Optional[str]]:
+    """``(名称, 版本)``；取不到就退回常量 / None。
+
+    取元数据这一步**不允许抛异常**：它只是画个标题，失败了顶多少印一个版本号，
+    不该让整条命令变成报错。
+    """
+    getter = getattr(server, "get_self_metadata", None)
+    if getter is None:
+        return _PLUGIN_NAME_FALLBACK, None
+    try:
+        metadata = getter()
+    except Exception:  # noqa: BLE001 - 标题而已，读不到就退让
+        return _PLUGIN_NAME_FALLBACK, None
+    name = getattr(metadata, "name", None) or _PLUGIN_NAME_FALLBACK
+    version = getattr(metadata, "version", None)
+    return name, (str(version) if version is not None else None)
+
+
+def _title_line() -> RTextList:
+    """顶栏：``========  Server Log Filter v1.4.0  ========``。
+
+    两侧等号数按标题长度算，凑到大约一行宽；名称与版本用不同颜色区分。
+    """
+    name, version = _plugin_title(_server)
+    core = "{} v{}".format(name, version) if version else name
+    bars = max(_TITLE_BAR_MIN, (_TITLE_WIDTH - len(core) - 4) // 2)
+    rule = "=" * bars
+    line = RTextList(RText(rule, RColor.gold), "  ", RText(name, RColor.aqua))
+    if version:
+        line.append(RText(" v" + version, RColor.yellow))
+    line.append("  ")
+    line.append(RText(rule, RColor.gold))
+    return line
+
+
+def _field(label: str, value: str, value_colour=RColor.green) -> RTextList:
+    """``标签: 值`` —— 标签 aqua、值默认绿（计数）。
+
+    帮助页是「命令 aqua / 说明 white」，状态页用同一套：标签 aqua、值 white 或 green、
+    备注 gray。两个界面看起来才是一家的。
+    """
+    return RTextList(RText(label, RColor.aqua), RText(value, value_colour))
+
+
+def _help_line(description: str, command: str, action) -> RTextList:
+    """一行 ``!!lf <子命令> -- 说明``，左栏按 ``_HELP_COMMAND_WIDTH`` 对齐。
+
+    点击只挂在前面的命令上（补的对齐空格不参与点击目标）；
+    命令用 aqua、说明用 white、分隔符用 gray——都比原来的 dark_gray 看得清。
+    """
+    padding = " " * (_HELP_COMMAND_WIDTH - len(command))
+    click = command + (" " if action is RAction.suggest_command else "")
+    return RTextList(
+        RText(command, RColor.aqua).set_click_event(action, click),
+        RText(padding + " -- ", RColor.gray),
+        RText(description, RColor.white),
+    )
+
+
+def _admin_denied_message(source) -> str:
+    """权限不足时说的话——默认那句「权限不足」会让人以为「我明明是 OP 啊」。
+
+    MCDR 的权限与游戏内的 OP **毫无关系**：它只读 ``permission.yml``，且默认级别是 ``user``。
+    这里把「你没有权限」和「怎么给自己权限」一起说清楚。
+    """
+    return _t("command.need_admin")
+
+
+
+def _show_help(source) -> None:
+    """没有子命令时的落地页：把可用的命令列出来。
+
+    以前裸 `!!logfilter` 与 `list` 显示同一屏状态，于是「命令记错了」和「我就是想看状态」
+    得到完全一样的回应——前者只能自己去翻 README。现在前者给帮助，`list` 才是状态。
+
+    每行做成可点击的，点击目标就是那行命令本身（显示什么就执行什么）。
+    ``test`` 需要跟一段日志文本，直接执行没有意义，所以只把命令**填进输入框**。
+
+    这里**不印状态页那句运行提示**（服务端日志不受影响之类）：这屏是命令清单，
+    运行时的注意事项属于状态页。
+
+    每条都写成独立的 ``_t("...")`` 调用（而不是循环里的变量）：键集不变式靠 AST 从调用点
+    收集字面量，键名一旦进了变量，检查就会把它当成「没人用」而报错。
+    """
+    run, suggest = RAction.run_command, RAction.suggest_command
+    parts = RTextList(
+        _title_line(),
+        "\n",
+        RText(_t("help.usage", command=COMMAND, alias=COMMAND_ALIAS), RColor.gray),
+        "\n",
+        RText(_t("help.permission"), RColor.yellow),
+        "\n",
+        _help_line(
+            _t("help.entry_help"), COMMAND_ALIAS + " help", run
+        ),
+        "\n",
+        _help_line(
+            _t("help.entry_list"), COMMAND_ALIAS + " list", run
+        ),
+        "\n",
+        _help_line(
+            _t("help.entry_test"), COMMAND_ALIAS + " test", suggest
+        ),
+        "\n",
+        _help_line(
+            _t("help.entry_reload"), COMMAND_ALIAS + " reload", run
+        ),
+        "\n",
+        _help_line(
+            _t("help.entry_reset"), COMMAND_ALIAS + " reset", run
+        ),
+    )
+    source.reply(parts)
+
+
 def _show_status(source) -> None:
     if _log_filter is None:
         source.reply(RText(_t("cmd.not_initialised"), RColor.red))
@@ -937,15 +1077,12 @@ def _show_status(source) -> None:
     else:
         language_line = _t("status.language_set", code=_language)
     parts = RTextList(
-        RText(_t("status.header"), RColor.aqua),
+        _title_line(),
         "\n",
-        RText(_t("status.rule_count"), RColor.gray),
-        RText(str(len(rules)), RColor.green),
-        RText(_t("status.hidden_now"), RColor.gray),
-        RText(str(_log_filter.total), RColor.green),
-        RText(_t("status.lines"), RColor.gray),
+        _field(_t("status.rule_count"), str(len(rules))),
+        _field(_t("status.hidden_now"), str(_log_filter.total) + _t("status.lines")),
         "\n",
-        RText(language_line, RColor.dark_gray),
+        _field(_t("status.language_label"), language_line, RColor.white),
     )
 
     if not rules:
@@ -953,17 +1090,26 @@ def _show_status(source) -> None:
         parts.append(RText(_t("status.no_rules"), RColor.yellow))
 
     threshold = _config.stale_rule_threshold if _config is not None else 0
+    # 编号**只在真的需要时才补空格**：10 条以上补到两位，让 ``]`` 对齐；
+    # 9 条以内直接印 ``[1]``，那个空格对用户只是噪音（曾被问过一次）。
+    index_width = len(str(len(rules)))
     for index, rule in enumerate(rules, start=1):
         parts.append("\n")
-        parts.append(RText(_t("status.rule_index", index=index), RColor.dark_gray))
+        parts.append(
+            RText(
+                _t("status.rule_index", index=str(index).rjust(index_width)),
+                RColor.gray,
+            )
+        )
         parts.append(RText(_t("status.rule_hits", count=rule.count), RColor.green))
+        parts.append(RText("-- ", RColor.gray))
         parts.append(RText(rule.pattern, RColor.white))
         entry = _state.rules.get(rule.pattern) if _state is not None else None
         if entry is not None and entry.last_hit_session:
             parts.append(
                 RText(
                     _t("status.last_hit", session=entry.last_hit_session),
-                    RColor.dark_gray,
+                    RColor.gray,
                 )
             )
         if entry is not None and entry.zero_streak:
@@ -973,23 +1119,32 @@ def _show_status(source) -> None:
                 )
             else:
                 parts.append(
-                    RText(_t("status.streak", streak=entry.zero_streak), RColor.dark_gray)
+                    RText(_t("status.streak", streak=entry.zero_streak), RColor.gray)
                 )
 
     if _rejected_patterns:
         parts.append("\n")
         parts.append(
-            RText(_t("status.rejected", count=len(_rejected_patterns)), RColor.yellow)
+            _field(
+                _t("status.rejected_label"),
+                _t("status.rejected", count=len(_rejected_patterns)),
+                RColor.yellow,
+            )
         )
 
     if _state is not None and _state.session_index:
         parts.append("\n")
         parts.append(
-            RText(_t("status.sessions", count=_state.session_index), RColor.dark_gray)
+            _field(
+                _t("status.sessions_label"),
+                _t("status.sessions", count=_state.session_index),
+                RColor.white,
+            )
         )
 
     parts.append("\n")
-    parts.append(RText(_t("status.tip"), RColor.dark_gray))
+    parts.append(RText(_t("status.tip_label"), RColor.aqua))
+    parts.append(RText(_t("status.tip"), RColor.gray))
     source.reply(parts)
 
 
@@ -1061,5 +1216,5 @@ def _test_line(source, context) -> None:
         )
     if body != text:
         reply.append("\n")
-        reply.append(RText(_t("test.stripped_note"), RColor.dark_gray))
+        reply.append(RText(_t("test.stripped_note"), RColor.gray))
     source.reply(reply)

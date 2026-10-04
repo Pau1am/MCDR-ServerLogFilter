@@ -93,6 +93,46 @@ open(os.path.join(os.path.dirname(__file__), ...))   # 仅作为解包运行的�
 `tools/mutation_check.py` 的 `skip_the_catalogues` 变异把 `pkgutil.get_data` 换成
 `data = None`，确认测试会因此变红。
 
+## 包体积：打包时剥掉注释与 docstring
+
+**仓库保留注释，包不保留。** `pack.py` 在建包时把每个 `.py` 的注释与 docstring 清空
+（`packaged_source()`），源码文件本身一字不动。实测这一步让产物从 **31,454 B 降到 21,605 B
+（−31%）**——注释与 docstring 在 `__init__.py` 里占原始字节的 16%，但占其**压缩后**体积的一半，
+因为它们是不重复的自然语言，deflate 压不动。
+
+两个实现要点：
+
+- 用 :mod:`tokenize` 找注释，**不用正则**：`#` 出现在字符串里（URL、颜色码、正则）时正则会把
+  字符串也切掉。有测试专门放一个 `"url#fragment"` 进去钉住这一点。
+- **清空而不是删行**：行号与仓库完全一致（有测试断言逐文件行数相等），
+  所以从已安装插件报出的 traceback 仍指向仓库源码的同一行。
+  函数体只有一句 docstring 时补 `pass`，否则不合法。
+- 剥完立刻 `compile()` 一次自检：发一个「解析不了」的包只会在用户那边爆炸，而这里是最后一道能拦住的关口。
+
+> ⛔ **不要试图换 bzip2 / lzma 压缩。** 它们纸面更小（bzip2 −9.8%、lzma −5.6%），
+> 但 **CPython 的 zipimport 只认 deflate**：实测在 Python 3.13 上直接
+> `zlib.error: Error -3 while decompressing data: invalid distance too far back`，
+> **插件完全加载不了**。这是硬限制，不是取舍。
+> ⚠️ 测这个必须在**隔离的 cwd** 里跑，否则 `import server_log_filter` 会命中工作目录里的源码，
+> 得到「能导入」的假阳性（第一次就踩了这个）。
+
+加上 CHANGELOG 精简（107 行 → 54 行）与压缩级别 6→9，**最终产物 19,817 B → 19,764 B（约 19.8 KB）**：
+比本轮起点小 37%，比 1.3.0（25,739 B）还小 23%。
+
+### 其余已穷尽、结论是不值的路（别再试）
+
+| 手段 | 实测收益 | 结论 |
+|---|---|---|
+| bzip2 / lzma | −9.8% / −5.6% | ⛔ zipimport 只认 deflate，**插件加载不了** |
+| 合并两个语言文件（键名只写一次） | −802 B (3.5%) | 值得换？不值得：改掉 `lang/<code>.json` 的约定、要动加载器与约 30 条语言测试，翻译者还得在一个文件里同时看到两种语言 |
+| 语言 JSON 压成单行 | −106 B (0.5%) | 牺牲仓库可读性，不值 |
+| 元数据 JSON 压成单行 | −35 B | 不值得一个 diff |
+| 压缩级别 6→9 | −53 B | ✅ 已采用（解压速度与级别无关，零运行开销） |
+| 删掉 `CONFIG_DOC` 的长说明 | 约 −1,020 B 原始 | ⛔ 那 11 条会被写进用户的 `config.json` 当选项注释，是插件唯一的自带文档 |
+| 只发 `.pyc` | — | ⛔ 与 Python 版本绑定，MCDR 支持多版本 → 直接不可用 |
+| 删 LANGUAGE / LICENSE | 627 B | 随包分发是 MIT 的常规做法，且用户明确要求保留 |
+
+
 ## 自行打包
 
 ```bash
@@ -176,18 +216,18 @@ PYTHONPATH=.testlibs python -m pytest tests -v     # Windows: $env:PYTHONPATH=".
 > 出问题就在那一轮集中修，修完再提 PR。这样既避免反复烧时间，又保证合并前是完整的证据。
 > 汇报时说清「哪些跑过、哪些没跑」，不要用「全绿」掩盖没跑的部分。
 
-当前 **221 个用例**，分三层：
+当前 **263 个用例**，分三层：
 
 | 层 | 位置 | 说明 |
 |---|---|---|
-| 单元 | `tests/test_plugin.py` | 过滤逻辑、配置对象、命令面、打包、迁移、坏配置保全、语言（188 条） |
-| 端到端 | `tests/test_e2e.py` | 启动**真实 MCDR**，加载 `pack.py` 产出的 `.mcdr`，用假服务端跑完整生命周期（33 条） |
+| 单元 | `tests/test_plugin.py` | 过滤逻辑、配置对象、命令面、打包、迁移、坏配置保全、语言、命令面与权限与界面与打包（226 条） |
+| 端到端 | `tests/test_e2e.py` | 启动**真实 MCDR**，加载 `pack.py` 产出的 `.mcdr`，用假服务端跑完整生命周期（37 条） |
 | 跨版本 | `tools/mcdr_matrix.py` | 同一个包在多个 MCDR 版本上逐项核对 |
 
 另有两个工具：
 
 ```bash
-python tools/mutation_check.py    # 故意改坏实现，确认测试会变红（33 个变异，33/33 应被抓住）
+python tools/mutation_check.py    # 故意改坏实现，确认测试会变红（46 个变异，46/46 应被抓住）
 python benchmarks/bench_filter.py # 性能基准，README / CHANGELOG 里引用的数字都由它产出
 python benchmarks/bench_versions.py 旧.mcdr 新.mcdr   # 两个版本逐项对比，见「版本间性能对比」
 ```
@@ -298,9 +338,86 @@ python tools/mcdr_matrix.py --current
 并且**真的没有出现在控制台上**，同时**事件仍然照常派发**。
 如果未来 MCDR 改变 `hidden()` 的语义，测试会直接失败，而不是让插件在服务器上静默出问题。
 
-端到端组共有 **11 次真实 MCDR 启动**（正常一次、零命中提醒一次、坏配置一次、
+端到端组共有 **12 次真实 MCDR 启动**（正常一次、零命中提醒一次、坏配置一次、
 关掉写坏提示一次、删规则前后各一次、**`auto` 跟随 MCDR 两个方向各一次、显式语言压过 MCDR 一次、
-打包产物带语言文件一次、配置不是 UTF-8 一次**），整个 `tests` 目录约 33 秒，可用 `MCDR_SKIP_E2E=1` 跳过。
+打包产物带语言文件一次、配置不是 UTF-8 一次、真的敲一遍命令一次**），
+整个 `tests` 目录约 40 秒，可用 `MCDR_SKIP_E2E=1` 跳过。
+
+> **命令面在真 MCDR 上是被真的敲出来的**，不是只对着假服务器断言。探针插件在
+> `on_server_startup` 里调 `server.execute_command('!!lf')` 等四条命令，再用横幅把每段输出夹起来
+> （`E2E-CMD-BEGIN/END`），测试逐段读取。**这条路径的威力在于**：`execute_command` 与
+> `PluginCommandSource` 都是真实实现，所以「别名到底有没有注册进 MCDR」这种问题在这里藏不住。
+> 它由环境变量 `E2E_COMMAND_PROBE` 开关，**只在需要的那一个实例里打开**——其余实例的输出
+> 保持逐字节不变，因为好几个用例是靠「某个字符串**不出现**」来断言的。
+
+> **在探针里写代码要小心一件事**：它是嵌在 `test_e2e.py` 的三引号字符串里的，所以探针自己的
+> 代码里**不能出现三引号 docstring**（会把外层字符串提前截断，报一个很难看懂的
+> `unterminated string literal`）。探针里一律用 `#` 注释。
+>
+### 权限门为什么写在根节点上
+
+全部子命令都限 ADMIN（状态页会印出用户写的规则，`test` 会验证日志内容）。
+要求**只写在根 Literal 上**：MCDR 的 `_execute_command` 在解析路径上对**每个节点**都跑一遍
+`__check_requirements`，所以根上一个要求就门住了所有分支。
+在五个子命令上各写一遍是重复的声明，新增子命令时最容易漏掉一个。
+
+**被拒时要给出可操作的理由。** MCDR 默认只回一句「权限不足」，而玩家会想「我明明是 OP 啊」——
+   因为 MCDR 根本不读原版 OP：权限只来自 `permission.yml`（默认 `user`），
+   `.testlibs` 里没有任何读取 `ops.json` 的代码。所以用
+   `requires(_admin_only, failure_message_getter=_admin_denied_message)` 把「怎么办」一并说出来
+   （`failure_message_getter` 自 MCDR 2.7.0 起支持，远早于我们的 2.15.0 门槛）。
+
+验证方式值得记下来：**不要**只看 `_requirements` 就该下结论。测试用 MCDR 真实的
+`node._entry_execute(source, command)`，以 USER / ADMIN 两种 source 各跑一遍，
+断言 USER 抛 `RequirementNotMet`、ADMIN 能拿到执行项。
+（别用 `_execute_command`：MCDR 在那里只是**收集**执行项、稍后才真正调用，
+所以「没抛异常」并不代表命令会被执行——这一点最初的测试就写错了一次。）
+
+### 两个界面的排版：宽度、对齐、配色
+
+三条硬性要求，都是用户提的，各自有测试钉住：
+
+**帮助页与状态页共用同一套视觉语言**，不是各写一份：同一个 `_title_line()`，
+标签一律 `aqua`（帮助页的命令、状态页的「规则数: / 语言: / 提示:」都用它），
+内容 `white` 或绿，备注 `gray`。这条不是审美偏好——两个界面长成两家，用户会以为
+它们来自不同插件。
+
+1. **顶栏约一行宽**：MC 聊天默认字体下大约 53 列。等号数量**按标题长度算**
+   （`(_TITLE_WIDTH - len(core) - 4) // 2`），所以换版本号、改插件名都不会破坏两侧对称。
+2. **说明文字对齐成一列**：左栏宽度 = `len(别名) + 1 + 最长子命令`，用常量**算出来**
+   而不是写死数字——以后加子命令，对齐自动跟着走。
+   ⚠️ **对齐只在它真的买到对齐时才该补。** 规则编号原来写死 `{index:>2}`，
+   于是 1 条规则时印成 `[ 1]`——那个空格是为 10 条以上准备的，9 条以内纯属噪音
+   （用户问过一次「为什么中间有个空格」）。现在宽度按当前条数算：
+   `len(str(len(rules)))`，两种规模都有测试钉住。**「为了整齐而补的空格」也要能说清它对齐了什么。**
+   ⚠️ 补出来的对齐空格**不能**算进点击目标，否则点击时命令后面会多带一串空格。
+   状态页的规则行同样有测试钉住「`--` 落在同一列」。
+3. **不用 `dark_gray` / `black`**：管理员多半在深色终端上看，深灰字几乎看不见。
+   有帮助页与状态页各一条测试扫描整棵 RText 树的 `color` 字段。
+
+把命令与说明分色还有个副作用值得记：**i18n 里不再需要重复写一遍命令**
+（原先是 `"{command} list —— 查看状态"`），命令部分由代码拼。少了一处「同一件事写两遍」。
+
+⚠️ 顶栏的版本号来自 `server.get_self_metadata().version`（2.15.0 就有）。
+这一步**包在 try 里**：它只是画个标题，读不到顶多少印一个版本号，
+不该让整条命令变成报错——与「捕获的类型太窄」一节是同一条道理。
+
+⛔ **写这类「扫颜色」的测试时必须扫原对象，不能扫 `str(reply)`。**
+本轮的 `test_the_help_page_has_no_dark_text` 第一版就是先 `str()` 再找颜色，
+而字符串里根本没有颜色信息 → 断言永远空过（典型的花架子测试）。
+**是变异检查抓到的**：把说明改回 `dark_gray` 竟然全绿。改扫 RText 对象后立刻变红。
+
+### 帮助行为什么是整行可点击、以及控制台的限制
+
+帮助页每行都 `set_click_event`，点击目标就是那行命令本身（显示什么就执行什么）；
+`test` 例外，用 `suggest_command` 把命令**填进输入框**——它还要跟一段日志文本，直接执行没有意义。
+
+⛔ **MCDR 控制台不支持点击。** `misc_utils.print_text_to_console` 走
+`RTextBase.to_colored_text()`，而该方法的 docstring 明确写着
+「Click event and hover event will be ignored」。所以：
+按钮只对**游戏内聊天**有用；控制台里那几行必须**本身就是可复制的命令文本**——
+有一条测试专门钉住这一点（`test_the_help_text_stays_usable_as_plain_text`），
+免得哪天改成纯按钮，控制台里的管理员就什么都看不到了。
 
 > **e2e 里的语言是分两处控制的**，因为 MCDR 自己的界面文案会被断言扫到：
 > `_build_instance(..., mcdr_language="en_us", plugin_language="zh_cn")` ——
@@ -616,8 +733,8 @@ Minecraft 侧：过滤发生在 MCDR 侧（对服务端 stdout 逐行匹配）�
 
 0. **提 PR 前统一跑一次完整清单**（开发过程中只跑相关子集）：
    ```bash
-   PYTHONPATH=.testlibs python -m pytest tests -q      # 全量 221
-   python tools/mutation_check.py                      # 33/33
+   PYTHONPATH=.testlibs python -m pytest tests -q      # 全量 263
+   python tools/mutation_check.py                      # 46/46
    python tools/mcdr_matrix.py <mcdr2150> <mcdr215> <mcdr216>   # 跨版本矩阵
    ```
    出现问题就在这一轮集中修，修完再提 PR。**矩阵不通过就不发版。**
