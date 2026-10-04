@@ -149,7 +149,7 @@ Prefer quiet? Set `announce_config_upgrade` to `false` — see "Turning the noti
 
 One side note: a **mistyped** option name is also treated as redundant and removed. Your config
 therefore never accumulates dead entries — but a typo fails silently rather than erroring, so run
-`!!logfilter` once after editing to confirm the change took effect.
+`!!logfilter list` once after editing to confirm the change took effect.
 
 ### What happens if you break the config file
 
@@ -269,13 +269,29 @@ Two details worth knowing:
 
 ## Commands
 
+**`!!logfilter` and `!!lf` are interchangeable** — every row below works with either
+spelling (the table uses the long form).
+
 | Command | Permission | Description |
 |---|---|---|
-| `!!logfilter` | user | Show status: rule count, per-rule hits and idle streaks, the active language and where it came from, and how many rules were skipped |
-| `!!logfilter list` | user | Same as above |
-| `!!logfilter test <text>` | user | Check whether a line would be hidden, and which rule matches |
-| `!!logfilter reload` | admin | Re-read the config file and apply it immediately; also forgets rules removed from it |
-| `!!logfilter reset` | admin | Clear the idle-session counters and start observing again |
+| `!!logfilter` | **admin** | Show this help: the list of available commands |
+| `!!logfilter help` | **admin** | Same as above |
+| `!!logfilter list` | **admin** | Show status: rule count, per-rule hits and idle streaks, the active language and where it came from, and how many rules were skipped |
+| `!!logfilter test <text>` | **admin** | Check whether a line would be hidden, and which rule matches |
+| `!!logfilter reload` | **admin** | Re-read the config file and apply it immediately; also forgets rules removed from it |
+| `!!logfilter reset` | **admin** | Clear the idle-session counters and start observing again |
+
+> **Every one of these needs administrator permission**: the status screen prints the rules
+> you wrote, and `test` shows which log lines they match.
+>
+> ⚠️ **MCDR permission is not the same thing as being op in the game.** MCDR only reads its own
+> `permission.yml`, and an unlisted player defaults to `user` — so being op in-game is not
+> enough. To grant it, run `!!MCDR permission set <your name> admin` in the MCDR console
+> (or add the name to `permission.yml` by hand). The plugin tells you this when it refuses.
+>
+> In **in-game chat**, each help line is clickable — clicking runs that very command. The MCDR
+> console cannot do that (MCDR drops click events when rendering for the console), but every
+> line is plain, copyable command text there anyway.
 
 `!!logfilter test` is especially handy: paste a line from your log to verify the rule without waiting for it to actually fire.
 Pasting the whole console line works too — the `[time] [thread/level]:` prefix is stripped first,
@@ -321,7 +337,8 @@ Those same lines are **still complete** in `server/logs/latest.log`.
 | A rule is reported as idle | Its regex is probably wrong, or that log line no longer occurs — follow the advice in the reminder |
 | The config file was reset | Look for `config.json.old`: that is your original file. The message names the cause and the line number |
 | It was reset because the file is "not valid UTF-8" | Your editor saved it as ANSI/GBK; re-save it as UTF-8 (copy the content back from `config.json.old`) |
-| Which language is it speaking? | Run `!!logfilter`: the status line names the language and whether it follows MCDR or is pinned in the config |
+| Which language is it speaking? | Run `!!logfilter list`: the status line names the language and whether it follows MCDR or is pinned in the config |
+| A player says the command does nothing | These commands are admin-only; players get "permission denied". Grant ADMIN if you want them to see it |
 | Temporarily disable filtering | Empty `patterns`, then `!!logfilter reload` |
 
 ## Requirements & compatibility

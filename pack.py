@@ -19,6 +19,11 @@ Only these are shipped:
 * ``server_log_filter/lang/*.json`` — the message catalogues (one file per language)
 * ``LICENSE``, ``CHANGELOG.md`` — licence text and the shipped changelog
 
+The ``.py`` files are shipped with their comments and docstrings blanked out
+(``packaged_source()``): the repository keeps them, the artifact does not need them, and
+they were about an eighth of the artifact. Line numbers are preserved, so a traceback
+from the installed plugin still points at the right line of the repository file.
+
 ``README.md`` / ``README_en.md`` are deliberately **excluded**: they are long, they
 duplicate what the release page already says, and MCDR never reads them. Keeping
 them out cuts roughly half off the artifact. ``server_log_filter/lang/README.md``
@@ -27,8 +32,11 @@ them out cuts roughly half off the artifact. ``server_log_filter/lang/README.md`
 ``pack.py`` itself is intentionally **not** included, for the same root-module reason.
 """
 
+import ast
+import io
 import json
 import sys
+import tokenize
 import zipfile
 from pathlib import Path
 
@@ -98,6 +106,77 @@ def collect() -> list:
     return sorted(files)
 
 
+def _blank_comments(source: str) -> str:
+    """Replace every ``#`` comment with nothing, **keeping the line itself**.
+
+    Uses :mod:`tokenize` rather than a regex, so a ``#`` inside a string literal (a URL,
+    a regex, a colour code) is left alone. Blanking instead of deleting keeps line
+    numbers identical to the repository file.
+    """
+    lines = source.splitlines(keepends=True)
+    for token in tokenize.generate_tokens(io.StringIO(source).readline):
+        if token.type == tokenize.COMMENT:
+            row, col = token.start
+            line = lines[row - 1]
+            newline = "\n" if line.endswith("\n") else ""
+            lines[row - 1] = line[:col].rstrip() + newline
+    return "".join(lines)
+
+
+def _blank_docstrings(source: str) -> str:
+    """Same treatment for docstrings.
+
+    A body whose only statement was the docstring gets ``pass`` instead, otherwise the
+    result would not compile.
+    """
+    tree = ast.parse(source)
+    lines = source.splitlines(keepends=True)
+    for node in ast.walk(tree):
+        if not isinstance(
+            node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            continue
+        body = node.body
+        if not body:
+            continue
+        first = body[0]
+        if not (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            continue
+        # ``def f(): "doc"`` puts the docstring on the header line; blanking that line
+        # would delete the definition. Leave such (rare) forms untouched.
+        header_line = getattr(node, "lineno", None)
+        if header_line is not None and first.lineno == header_line:
+            continue
+        lines[first.lineno - 1] = (
+            " " * first.col_offset + "pass\n" if len(body) == 1 else "\n"
+        )
+        for index in range(first.lineno, first.end_lineno):
+            lines[index] = "\n"
+    return "".join(lines)
+
+
+def packaged_source(path: Path) -> bytes:
+    """The bytes to ship for one ``.py`` file: comments and docstrings blanked out.
+
+    Line numbers are preserved on purpose — an exception from the installed plugin then
+    reports the same line as the repository file it came from.
+
+    The result is compiled once here: shipping a file that does not parse would only be
+    discovered by a user, and this is the last place that can catch it.
+    """
+    source = path.read_text(encoding="utf-8")
+    stripped = _blank_comments(_blank_docstrings(source))
+    try:
+        compile(stripped, str(path), "exec")
+    except SyntaxError as error:  # pragma: no cover - a bug in the stripper
+        raise SystemExit("stripping {} produced invalid code: {}".format(path, error))
+    return stripped.encode("utf-8")
+
+
 def build(out_path: Path) -> Path:
     files = collect()
     if not files:
@@ -108,9 +187,17 @@ def build(out_path: Path) -> Path:
     if not any(p.parent == SRC / PACKAGE_NAME for p in files):
         raise SystemExit(f"{PACKAGE_NAME}/ contains no .py files")
 
-    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
+    # 压缩级别 9：只影响打包耗时。deflate 的**解压**速度与压缩级别无关
+    # （格式没变，只是编码端多花点力气），所以对用户是零开销。
+    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
         for path in files:
-            zf.write(path, path.relative_to(SRC).as_posix())
+            rel = path.relative_to(SRC).as_posix()
+            if path.suffix == ".py":
+                # Comments stay in the repository, where they are useful to read;
+                # the artifact only needs the code.
+                zf.writestr(rel, packaged_source(path))
+            else:
+                zf.write(path, rel)
     return out_path
 
 

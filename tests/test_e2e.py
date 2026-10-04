@@ -18,6 +18,7 @@ They are slower than the unit suite. Skip with::
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -88,10 +89,28 @@ import os
 import pathlib
 
 
+def _run_commands(server):
+    # Drive the command surface and banner each reply.
+    # execute_command is a public ServerInterface method (since 2.15.0) and a
+    # PluginCommandSource replies straight to the console, so the suite can read what a
+    # real MCDR printed for !!lf without an interactive console.
+    for name, command in [
+        ('bare-alias', '!!lf'),
+        ('bare-full', '!!logfilter'),
+        ('help', '!!logfilter help'),
+        ('list', '!!logfilter list'),
+    ]:
+        server.logger.info('E2E-CMD-BEGIN ' + name)
+        server.execute_command(command)
+        server.logger.info('E2E-CMD-END ' + name)
+
+
 def on_server_startup(server):
     marker = os.environ.get('E2E_STARTUP_MARKER')
     if marker:
         pathlib.Path(marker).write_text('SERVER_STARTUP dispatched', encoding='utf-8')
+    if os.environ.get('E2E_COMMAND_PROBE'):
+        _run_commands(server)
 """
 
 MCDR_CONFIG = """\
@@ -198,13 +217,20 @@ def _build_instance(
     return root
 
 
-def run_mcdr(root: Path, timeout: float = 90.0) -> str:
-    """Run MCDR to completion in ``root`` and return everything it printed."""
+def run_mcdr(root: Path, timeout: float = 90.0, command_probe: bool = False) -> str:
+    """Run MCDR to completion in ``root`` and return everything it printed.
+
+    ``command_probe`` makes the bundled probe plugin type the commands on startup. It is
+    off by default so that the other instances' console output stays exactly as it was —
+    several of them assert on the *absence* of strings.
+    """
     env = dict(os.environ)
     env["PYTHONPATH"] = str(TESTLIBS)
     env["PYTHONIOENCODING"] = "utf-8"
     env["MCDR_DISABLE_TELEMETRY"] = "1"
     env["E2E_STARTUP_MARKER"] = str(root / "startup_event_fired")
+    if command_probe:
+        env["E2E_COMMAND_PROBE"] = "1"
 
     stdout_path = root / "stdout.txt"
     with open(stdout_path, "w", encoding="utf-8") as fh:
@@ -873,3 +899,71 @@ def test_the_non_utf8_reset_names_the_real_cause(non_utf8_config_e2e_output):
     assert "has been reset to the default config" in output
     assert "not valid UTF-8" in output, output[-2000:]
     assert "config.json.old" in output
+
+
+# ---------------------------------------------------------------------------
+#  the command surface on a real MCDR: !!lf, the bare command, help and list
+# ---------------------------------------------------------------------------
+
+_LOG_PREFIX = re.compile(r"^\[[^\]]*\]\s*\[[^\]]*\]\s*:?\s?")
+
+
+def _command_block(name, output):
+    """What MCDR printed between the two banners around one probed command.
+
+    The logger's per-line prefix is stripped: it carries a wall-clock time, so two
+    otherwise identical screens could differ if a second ticked over between them.
+    """
+    begin = output.index("E2E-CMD-BEGIN " + name)
+    end = output.index("E2E-CMD-END " + name)
+    lines = output[begin:end].splitlines()[1:]
+    return [stripped for stripped in (_LOG_PREFIX.sub("", l).strip() for l in lines) if stripped]
+
+
+@pytest.fixture(scope="module")
+def command_probe_e2e_output(tmp_path_factory):
+    """One MCDR run whose probe plugin types the commands on startup."""
+    _require_mcdr()
+    root = tmp_path_factory.mktemp("mcdr_e2e_commands")
+    _build_instance(root)
+    return run_mcdr(root, command_probe=True), root
+
+
+def test_the_lf_alias_works_on_a_real_mcdr(command_probe_e2e_output):
+    """The alias has to survive MCDR's own command registration, not just our fake.
+
+    If ``!!lf`` were not registered, MCDR would answer with its "unknown command"
+    error instead of the help screen.
+    """
+    output, _ = command_probe_e2e_output
+    block = "\n".join(_command_block("bare-alias", output))
+
+    assert "用法: !!logfilter" in block, block
+    assert "unknown" not in block.lower(), "!!lf was not recognised: {}".format(block)
+
+
+def test_the_bare_command_shows_help_not_status(command_probe_e2e_output):
+    output, _ = command_probe_e2e_output
+    block = "\n".join(_command_block("bare-full", output))
+
+    assert "用法: !!logfilter" in block, block
+    assert "本次已隐去" not in block, "a bare command must not print live counters"
+
+
+def test_the_help_subcommand_prints_the_same_screen(command_probe_e2e_output):
+    """`!!logfilter`, `!!lf` and `!!logfilter help` are one screen, not three."""
+    output, _ = command_probe_e2e_output
+    bare = _command_block("bare-alias", output)
+    explicit = _command_block("help", output)
+
+    assert bare, "the alias produced no output at all"
+    assert bare == explicit, "alias/help screens differ:\n{}\n---\n{}".format(bare, explicit)
+
+
+def test_list_prints_the_status_screen(command_probe_e2e_output):
+    output, _ = command_probe_e2e_output
+    block = "\n".join(_command_block("list", output))
+
+    assert "规则数" in block, block
+    assert "本次已隐去" in block, block
+    assert "用法: !!logfilter" not in block, "list must not fall back to the help screen"

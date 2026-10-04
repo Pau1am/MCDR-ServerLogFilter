@@ -12,7 +12,7 @@ on each one:
 * ``state.json`` is written and the session/streak bookkeeping advances;
 * the messages come out in Chinese, which is also what proves ``language: auto``
   follows MCDR's own setting on that MCDR version (the instance is pinned to zh_cn);
-* the command tree registers (``!!logfilter`` plus list/reload/reset/test);
+* the command tree registers (``!!logfilter`` / ``!!lf`` plus help/list/reload/reset/test);
 * no traceback comes out of the plugin.
 
 Usage::

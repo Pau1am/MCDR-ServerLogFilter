@@ -1,6 +1,6 @@
 # 测试 / Tests
 
-本目录是 Server Log Filter 的测试套件。**221 个用例**，覆盖过滤行为、配置、
+本目录是 Server Log Filter 的测试套件。**263 个用例**，覆盖过滤行为、配置、
 命令面、发布打包、**真实 MCDR 端到端**、**多语言**，以及本插件最核心的安全属性
 （被隐去的行仍保留 `process`，事件照常分发）。
 
@@ -34,7 +34,7 @@ $env:PYTHONPATH=".testlibs"; python -m pytest tests -v
 预期输出结尾：
 
 ```
-221 passed
+263 passed
 ```
 
 > **开发中不用每次都跑全量。** 改哪一块就只跑那一块，确认当前版本能过即可，例如
@@ -60,9 +60,10 @@ $env:PYTHONPATH=".testlibs"; python -m pytest tests -v
 | **坏配置的保全与重建** | **13** | 见下 |
 | **写坏提示的开关** | **11** | 开关从**写坏的原文**里读取（大小写 / 空格 / 位置随意、同名后缀不算、找不到按默认开启）；被静默的只有消息，备份照做；「连备份都失败」不受开关影响 |
 | **语言（i18n）** | **29** | 见下；`auto` 双向跟随、显式值压过 MCDR、宽松识别、未知语言回落、坏目录不崩、**打包后仍读得到文案**、英文真的到达每一处输出，外加一整套目录结构不变式 |
+| **命令面、权限、界面与打包** | **47** | `!!lf` 别名（一个节点两条字面量）、帮助页、`help`/`list` 的接线，以及 4 条在**真 MCDR** 上真的敲一遍命令的端到端 |
 | **1.3.0 的修复** | **9** | 非 UTF-8 配置被备份而非致命（2）、`test` 剥掉控制台前缀（2）、状态里显示语言来源与被跳过的规则（2）、量化符溢出与深层嵌套不再致命（2）、坏模板的 `AttributeError`（1） |
 | **端到端（真实 MCDR）** | **33** | 见下 |
-| **合计** | **221** | |
+| **合计** | **263** | |
 
 > 计数含 `@pytest.mark.parametrize` 展开后的用例数，与 `pytest --collect-only` 一致。
 
@@ -346,7 +347,7 @@ JSON 很严格，手工加规则时漏一个逗号就会解析失败，而 MCDR 
 python tools/mutation_check.py
 ```
 
-脚本会依次注入 33 个缺陷，要求相关用例变红；全绿即视为测试失效。
+脚本会依次注入 46 个缺陷，要求相关用例变红；全绿即视为测试失效。
 
 > **判定看 pytest 的退出码：只有 `exit == 1` 才算「被抓住」。** `4`（命令行用法错误）
 > 和 `5`（没收集到用例）都说明**脚本自己写错了**，不是测试变红——早期把 `4` 也当命中，
@@ -388,6 +389,19 @@ python tools/mutation_check.py
 | **非 UTF-8 配置按致命错误处理** | `test_a_config_that_is_not_utf8_is_quarantined`、`test_a_non_utf8_config_does_not_stop_the_plugin` |
 | **去掉探测预算的下限** | `test_a_nonsense_probe_budget_does_not_reject_every_rule` |
 | **`test` 不再剥控制台前缀** | `test_the_test_command_strips_the_console_prefix` |
+| **裸命令又接回状态页** | `test_the_bare_command_is_wired_to_the_help_screen` |
+| **`!!lf` 别名被去掉** | `test_the_root_literal_answers_to_both_spellings`、`test_both_spellings_reach_mcdrs_help_list` |
+| **权限门敞开**（任何玩家都能看到规则与日志内容） | `test_no_part_of_the_command_surface_is_open_to_players`（7 条参数化） |
+| **帮助行不再可点** | `test_the_help_lines_are_clickable` |
+| **权限拒绝的理由被去掉**（玩家又会以为是「我明明是 OP」） | `test_the_denial_explains_that_mcdr_permission_is_not_vanilla_op` |
+| **顶栏不显示版本号** | `test_the_title_bar_names_the_plugin_and_the_version`、`test_the_title_uses_a_different_colour_for_the_version` |
+| **帮助行不再对齐** | `test_help_rows_are_aligned_in_one_column` |
+| **重新用上深灰字** | `test_the_help_page_has_no_dark_text`、`test_the_status_screen_has_no_dark_text_either` |
+| **状态页规则行丢了分隔符** | `test_status_rule_rows_have_the_same_separator_as_help_rows` |
+| **状态页标签颜色与帮助页不一致** | `test_the_status_screen_uses_the_same_palette_as_help` |
+| **规则编号永远补到两位**（9 条以内出现 `[ 1]`） | `test_a_single_digit_rule_index_has_no_padding` |
+| **打包时又把注释发出去** | `test_the_packaged_code_carries_no_comments_or_docstrings` |
+| **剥注释时删行导致行号错位** | `test_stripping_keeps_line_numbers_so_tracebacks_still_match` |
 | **编译异常只接 `re.error`**（量化符溢出/深层嵌套又变致命） | `test_a_pattern_that_overflows_is_skipped_not_fatal`、`test_a_deeply_nested_pattern_is_skipped_not_fatal` |
 | **格式化异常只接三种**（`{a.b}` 又会让消息路径抛异常） | `test_a_template_with_a_bad_attribute_is_returned_raw` |
 

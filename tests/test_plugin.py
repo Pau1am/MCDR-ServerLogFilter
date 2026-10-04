@@ -37,6 +37,14 @@ import server_log_filter as slf
 from server_log_filter import i18n
 
 
+class _SelfMetadata:
+    """The slice of plugin metadata the help title reads."""
+
+    name = "Server Log Filter"
+    version = "1.4.0"
+from mcdreforged.api.types import PermissionLevel
+
+
 # ---------------------------------------------------------------------------
 #  helpers
 # ---------------------------------------------------------------------------
@@ -130,6 +138,10 @@ class FakePluginServer:
 
     def get_mcdr_language(self):
         return self.mcdr_language
+
+    def get_self_metadata(self):
+        """Mirrors ``ServerInterface.get_self_metadata`` — the help title reads it."""
+        return _SelfMetadata()
 
     def get_data_folder(self):
         """A throwaway folder by default, so no real config file is ever touched."""
@@ -449,7 +461,7 @@ def test_on_load_registers_filter_help_and_command():
     fake = FakePluginServer()
     slf.on_load(fake, None)
     assert len(fake.info_filters) == 1
-    assert fake.help_messages and fake.help_messages[0][0] == "!!logfilter"
+    assert [prefix for prefix, _ in fake.help_messages] == ["!!logfilter", "!!lf"]
     assert len(fake.commands) == 1
 
 
@@ -502,29 +514,141 @@ def test_reload_rereads_config_and_reports_count():
     assert "已重载" in text
 
 
-def test_reload_requires_admin_permission():
-    """!!logfilter reload must be gated at ADMIN level."""
+class _RecordingSource:
+    """A command source that only records replies, for driving MCDR's real parser."""
+
+    def __init__(self, level):
+        self.level = level
+        self.replies = []
+
+    def has_permission(self, required):
+        return self.level >= required
+
+    def get_permission_level(self):
+        return self.level
+
+    def reply(self, message, **kwargs):
+        self.replies.append(str(message))
+
+
+def _entry_execute(command, level):
+    """Drive MCDR's real parse + requirement check, returning (rejected, executions).
+
+    ``_entry_execute`` is the same entry point ``CommandManager`` uses. Deliberately not
+    ``_execute_command``: MCDR *collects* executions there and runs them later, so that
+    call proves nothing about whether the callback would fire.
+    """
+    from mcdreforged.command.builder.exception import RequirementNotMet
+
     fake = FakePluginServer()
     slf.on_load(fake, None)
-    from mcdreforged.api.types import PermissionLevel
+    source = _RecordingSource(level)
+    try:
+        executions = list(fake.commands[0]._entry_execute(source, command))
+    except RequirementNotMet:
+        return True, []
+    return False, executions
 
-    cmd = fake.commands[0]
-    # walk the command tree looking for the 'reload' literal
-    reload_node = _find_literal(cmd, "reload")
-    assert reload_node is not None, "reload subcommand must exist"
-    requirements = [getattr(r, "requirement", r) for r in getattr(reload_node, "_requirements", [])]
-    assert requirements, "reload must carry a permission requirement"
 
-    class Src:
-        def __init__(self, level):
-            self.level = level
+@pytest.mark.parametrize("command", [
+    "!!logfilter", "!!lf", "!!logfilter help", "!!logfilter list",
+    "!!logfilter test hello", "!!logfilter reload", "!!logfilter reset",
+])
+def test_no_part_of_the_command_surface_is_open_to_players(command):
+    """整个命令面都限管理员。
 
-        def has_permission(self, required):
-            return self.level >= required
+    状态页会印出你写的规则、`test` 会验证日志内容——这些不该让普通玩家看到。
+    权限要求只写在根节点上，所以这条同时也在证明 MCDR 会把父节点的要求应用到子命令
+    （用 MCDR 自己的 `_entry_execute`，不是对着我们自己的 `_requirements` 断言）。
+    """
+    rejected, _ = _entry_execute(command, PermissionLevel.USER)
+    assert rejected, "{} 不该对普通玩家开放".format(command)
 
-    # every requirement must pass for ADMIN, and USER must be rejected
-    assert all(req(Src(PermissionLevel.ADMIN)) for req in requirements)
-    assert not all(req(Src(PermissionLevel.USER)) for req in requirements)
+
+@pytest.mark.parametrize("command", ["!!logfilter", "!!lf", "!!logfilter list"])
+def test_an_admin_can_run_them(command):
+    """门开着：管理员不但不被拒，而且命令真的排上了执行。"""
+    rejected, executions = _entry_execute(command, PermissionLevel.ADMIN)
+    assert not rejected, "管理员不该被拒绝"
+    assert executions, "命令应该真的被接受了"
+
+
+def test_the_denial_explains_that_mcdr_permission_is_not_vanilla_op():
+    """玩家是 OP 却用不了，是最容易让人困惑的一种失败。
+
+    MCDR 的权限只来自 permission.yml（默认 user），完全不读游戏内的 OP 状态，
+    所以默认那句「权限不足」必须补上「怎么办」。
+    """
+    from mcdreforged.command.builder.exception import RequirementNotMet
+
+    fake = FakePluginServer()
+    slf.on_load(fake, None)
+    source = _RecordingSource(PermissionLevel.USER)
+    try:
+        list(fake.commands[0]._entry_execute(source, "!!lf list"))
+    except RequirementNotMet as error:
+        reason = str(error.get_reason())
+    else:
+        raise AssertionError("普通玩家不该被放行")
+
+    assert "permission.yml" in reason, reason
+    assert "!!MCDR permission set" in reason, reason
+    assert "OP" in reason, "要点明与游戏内 OP 无关: {}".format(reason)
+
+
+def test_the_alias_is_gated_exactly_like_the_long_form():
+    """两条字面量在同一个节点上，所以权限不可能只盖住其中一个。"""
+    for command in ("!!logfilter list", "!!lf list"):
+        rejected, _ = _entry_execute(command, PermissionLevel.USER)
+        assert rejected, command
+
+
+def _click_events(reply):
+    """Every (action, value) pair in the serialized reply."""
+    from mcdreforged.minecraft.rtext.text import RTextBase
+
+    found = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            event = node.get("clickEvent")
+            if isinstance(event, dict):
+                found.append((event.get("action"), event.get("value")))
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(RTextBase.from_any(reply).to_json_object())
+    return found
+
+
+def test_the_help_lines_are_clickable():
+    """点一下 = 敲那行命令。"""
+    source = FakeSource()
+    slf._show_help(source)
+    events = _click_events(source.replies[0])
+
+    for command in ("!!lf list", "!!lf reload", "!!lf reset"):
+        assert ("run_command", command) in events, (command, events)
+    # test 需要跟一段日志文本：直接执行没有意义，只把它填进输入框
+    assert ("suggest_command", "!!lf test ") in events, events
+
+
+def test_the_help_text_stays_usable_as_plain_text():
+    """控制台渲染会丢弃点击事件，所以那几行必须**本身就是**可复制的命令。
+
+    这条不是在测 MCDR：它是在钉住「不加按钮也能用」这个前提——万一哪天做成纯按钮，
+    控制台里的管理员就什么都看不到了。
+    """
+    source = FakeSource()
+    slf._show_help(source)
+    plain = str(source.replies[0])
+
+    for needle in ("!!lf list", "!!lf test", "!!lf reload", "!!lf reset"):
+        assert needle in plain, "帮助行里必须直接写着命令: {}".format(needle)
+    assert "!!lf" in plain, "别名要能从帮助页发现"
 
 
 def _find_literal(node, name):
@@ -1137,7 +1261,7 @@ def test_status_command_surfaces_the_streak():
     slf._show_status(source)
     text = "".join(str(x) for x in source.replies)
     assert "连续 2 次开服零命中" in text
-    assert "已统计 2 个开服周期" in text
+    assert "开服周期: 2 个" in text
 
 
 def test_reset_command_clears_the_streak():
@@ -1851,7 +1975,8 @@ def test_auto_follows_mcdr():
     assert slf._language == "en_us"
     assert "Enabled 1 log filter rule" in announce_output(server)
     assert server.help_messages == [
-        ("!!logfilter", i18n.translate("help.logfilter", "en_us"))
+        ("!!logfilter", i18n.translate("help.logfilter", "en_us")),
+        ("!!lf", i18n.translate("help.logfilter", "en_us")),
     ]
 
 
@@ -2266,6 +2391,7 @@ def test_status_shows_the_language_and_where_it_came_from():
     start_plugin(config={"patterns": [LIVE], "language": "en_us"}, state=None)
     fixed = FakeSource()
     slf._show_status(fixed)
+    # 标签与值分色了，但拼起来的纯文本不变
     assert "Language: en_us (set in the config)" in "".join(
         str(x) for x in fixed.replies
     )
@@ -2288,7 +2414,7 @@ def test_status_reports_skipped_rules_and_the_last_hit():
     slf._show_status(status)
 
     text = "".join(str(x) for x in status.replies)
-    assert "条规则已被跳过" in text, text
+    assert "已跳过: 1 条规则" in text, text
     assert "上次命中：第 2 个开服周期" in text, text
 
 
@@ -2326,3 +2452,358 @@ def test_a_template_with_a_bad_attribute_is_returned_raw():
         assert i18n.translate("t", "xx_broken", a=1) == "{a.b}"
     finally:
         i18n._CATALOGS.pop("xx_broken", None)
+
+
+# ---------------------------------------------------------------------------
+#  15. 命令面：!!lf 别名与帮助页
+# ---------------------------------------------------------------------------
+
+def test_the_root_literal_answers_to_both_spellings():
+    """一个节点带两条字面量，而不是两棵会各自漂移的命令树。"""
+    fake = FakePluginServer()
+    slf.on_load(fake, None)
+    root = fake.commands[0]
+    assert root.literals == {slf.COMMAND, slf.COMMAND_ALIAS}, root.literals
+
+
+def test_both_spellings_reach_mcdrs_help_list():
+    """用户不该需要猜哪个拼法是「正式」的。"""
+    fake = FakePluginServer()
+    slf.on_load(fake, None)
+    assert [prefix for prefix, _ in fake.help_messages] == list(slf.ROOT_LITERALS)
+    assert all(msg for _, msg in fake.help_messages), "help text must not be empty"
+
+
+def test_the_bare_command_is_wired_to_the_help_screen():
+    """接线测试：函数写对了 ≠ 它真的被挂在了这个节点上。"""
+    fake = FakePluginServer()
+    slf.on_load(fake, None)
+    root = fake.commands[0]
+    assert getattr(root, "_callback", None) is slf._show_help, \
+        "a bare command must land on help, not on the status screen"
+
+
+def test_the_help_subcommand_is_wired_to_the_help_screen():
+    fake = FakePluginServer()
+    slf.on_load(fake, None)
+    node = _find_literal(fake.commands[0], "help")
+    assert node is not None, "there must be a `help` subcommand"
+    assert getattr(node, "_callback", None) is slf._show_help
+
+
+def test_list_still_shows_the_status_screen():
+    """`list` 是状态页，这一点不能被帮助页顶掉。"""
+    fake = FakePluginServer()
+    slf.on_load(fake, None)
+    node = _find_literal(fake.commands[0], "list")
+    assert node is not None
+    assert getattr(node, "_callback", None) is slf._show_status
+
+
+def test_the_help_screen_lists_every_subcommand():
+    fake = FakePluginServer()
+    slf.on_load(fake, None)
+    source = FakeSource()
+    slf._show_help(source)
+    text = "".join(str(x) for x in source.replies)
+
+    for needle in ("help", "list", "test", "reload", "reset"):
+        assert needle in text, "帮助页漏了 {}: {}".format(needle, text)
+    assert slf.COMMAND_ALIAS in text, "别名必须能从帮助页发现"
+    # 帮助页会**描述**状态页（所以「规则数」这个词会出现），但它不能是状态页本身：
+    # 用只有状态页才有的实时字段来区分。
+    assert "已隐去" not in text, "帮助页不该显示运行数据"
+    assert "语言：" not in text, "帮助页不该显示运行数据"
+
+
+def test_the_help_screen_is_translated():
+    start_plugin(config={"patterns": [LIVE], "language": "en_us"}, state=None)
+    source = FakeSource()
+    slf._show_help(source)
+    text = "".join(str(x) for x in source.replies)
+
+    assert "Usage: !!logfilter <subcommand>" in text, text
+    assert "(!!lf works too)" in text, text
+    assert "administrator permission" in text, "帮助页必须说明需要管理员权限"
+
+
+# ---------------------------------------------------------------------------
+#  16. 帮助页的排版与配色
+# ---------------------------------------------------------------------------
+
+def _colours(node):
+    """Every ``color`` value in a serialized RText tree, in order."""
+    from mcdreforged.minecraft.rtext.text import RTextBase
+
+    found = []
+
+    def walk(item):
+        if isinstance(item, dict):
+            if "color" in item:
+                found.append(item["color"])
+            for value in item.values():
+                walk(value)
+        elif isinstance(item, list):
+            for value in item:
+                walk(value)
+
+    walk(RTextBase.from_any(node).to_json_object())
+    return found
+
+
+def _help_text():
+    start_plugin(config={"patterns": [LIVE]}, state=None)
+    source = FakeSource()
+    slf._show_help(source)
+    return str(source.replies[0])
+
+
+def test_the_title_bar_names_the_plugin_and_the_version():
+    start_plugin(config={"patterns": [LIVE]}, state=None)
+    plain = str(slf._title_line())
+
+    assert plain.startswith("====="), plain
+    assert plain.endswith("====="), plain
+    assert "Server Log Filter" in plain, plain
+    assert " v" in plain and "1.4" in plain, "版本号要出现: {}".format(plain)
+    # 大约一行宽（MC 聊天默认字体）
+    assert 44 <= len(plain) <= 60, "顶栏宽度 {} 列不像一行: {!r}".format(len(plain), plain)
+
+
+def test_the_title_uses_a_different_colour_for_the_version():
+    """名称与版本要凭颜色分得开，而不是靠空格。"""
+    start_plugin(config={"patterns": [LIVE]}, state=None)
+    colours = _colours(slf._title_line())
+
+    assert colours.count("gold") == 2, "两侧等号同色: {}".format(colours)
+    assert "aqua" in colours, colours
+    assert "yellow" in colours, colours
+
+
+def test_the_title_degrades_gracefully_without_metadata():
+    """读不到元数据只是少印一个版本号，不该让整条命令变成报错。"""
+    class NoMetadata:
+        def get_mcdr_language(self):
+            return "zh_cn"
+
+    slf._server = NoMetadata()
+    try:
+        plain = str(slf._title_line())
+        start_plugin(config={"patterns": [LIVE]}, state=None)
+    finally:
+        pass
+
+    assert "Server Log Filter" in plain, plain
+    assert "None" not in plain, "版本号取不到时不能印出 None: {!r}".format(plain)
+
+
+def test_help_rows_are_aligned_in_one_column():
+    """说明文字要跟在同一列，不能因为子命令有长有短就左右乱跳。"""
+    lines = [l for l in _help_text().splitlines() if l.startswith(slf.COMMAND_ALIAS)]
+    assert len(lines) == 5, lines
+
+    columns = {l.index("-- ") for l in lines}
+    assert len(columns) == 1, "分隔符没有对齐: {}".format(sorted(columns))
+    assert columns.pop() > len(slf.COMMAND_ALIAS) + 1, "命令与说明之间要有间距"
+
+
+def test_the_help_page_has_no_dark_text():
+    """深灰/黑色在深色终端上几乎看不见。
+
+    ⚠️ 必须扫**原对象**而不是 ``str(...)``：转成字符串后颜色信息已经没了，
+    扫字符串会永远扫不出东西——这条测试最初就是这么写的，是变异检查
+    （「把说明改回 dark_gray」竟然没有被抓住）把它揪出来的。
+    """
+    start_plugin(config={"patterns": [LIVE]}, state=None)
+    source = FakeSource()
+    slf._show_help(source)
+
+    for screen in (source.replies[0], slf._title_line()):
+        bad = [c for c in _colours(screen) if c in ("dark_gray", "black")]
+        assert not bad, "出现了看不清的颜色 {}: {}".format(bad, screen)
+
+
+def test_the_status_screen_has_no_dark_text_either():
+    start_plugin(config={"patterns": [LIVE]}, state=None)
+    source = FakeSource()
+    slf._show_status(source)
+    bad = [c for c in _colours(source.replies[0]) if c in ("dark_gray", "black")]
+    assert not bad, "状态页出现了看不清的颜色: {}".format(bad)
+
+
+def test_the_help_page_does_not_repeat_the_runtime_tip():
+    """这屏是命令清单；「服务端日志不受影响」那类注意事项属于状态页。"""
+    text = _help_text()
+
+    assert "不受影响" not in text, text
+    assert "派发" not in text, text
+
+
+def test_the_status_screen_still_has_the_runtime_tip():
+    """帮助页拿掉了它，但状态页必须留着——否则这条提醒就彻底消失了。"""
+    start_plugin(config={"patterns": [LIVE]}, state=None)
+    source = FakeSource()
+    slf._show_status(source)
+    assert "不受影响" in str(source.replies[0])
+
+
+def _status_text(rules=(LIVE,)):
+    start_plugin(config={"patterns": list(rules)}, state=None)
+    source = FakeSource()
+    slf._show_status(source)
+    return source.replies[0]
+
+
+def _text_colours(node):
+    """``(text, colour)`` for every fragment of a serialized RText tree."""
+    from mcdreforged.minecraft.rtext.text import RTextBase
+
+    pairs = []
+
+    def walk(item):
+        if isinstance(item, dict):
+            if "text" in item:
+                pairs.append((item["text"], item.get("color")))
+            for value in item.values():
+                walk(value)
+        elif isinstance(item, list):
+            for value in item:
+                walk(value)
+
+    walk(RTextBase.from_any(node).to_json_object())
+    return pairs
+
+
+def test_the_status_screen_uses_the_same_palette_as_help():
+    """两个界面要像一家的：标签 aqua、值 white 或绿、备注 gray。
+
+    ⚠️ 必须逐个标签断言，不能只查「画面里存在 aqua」——提示行也是 aqua，
+    那样即使所有标签都退回 gray，断言依然通过（变异检查抓到过这一次）。
+    """
+    start_plugin(config={"patterns": [LIVE]}, state=None)
+    source = FakeSource()
+    slf._show_status(source)
+    pairs = _text_colours(source.replies[0])
+
+    for key in ("status.rule_count", "status.hidden_now",
+                "status.language_label", "status.tip_label"):
+        label = i18n.translate(key, "zh_cn")
+        assert (label, "aqua") in pairs, "{} 的标签该是 aqua：{!r}".format(key, pairs)
+    assert "white" in [c for _, c in pairs], pairs
+    assert "gray" in [c for _, c in pairs], pairs
+
+
+def test_status_rule_rows_have_the_same_separator_as_help_rows():
+    """规则行也用 ``--``，而且落在固定列上——和帮助页一个形状。"""
+    text = str(_status_text(rules=(LIVE, "joined the game", "moved too quickly")))
+    rows = [l for l in text.splitlines() if l.startswith(" [")]
+    assert len(rows) == 3, rows
+
+    columns = {r.index("-- ") for r in rows}
+    assert len(columns) == 1, "规则行的分隔符没对齐: {}".format(sorted(columns))
+
+
+def test_both_screens_start_with_the_same_title_bar():
+    """两个界面共用同一个顶栏，不各写一份。"""
+    start_plugin(config={"patterns": [LIVE]}, state=None)
+    help_source, status_source = FakeSource(), FakeSource()
+    slf._show_help(help_source)
+    slf._show_status(status_source)
+
+    assert str(help_source.replies[0]).splitlines()[0] == str(status_source.replies[0]).splitlines()[0]
+
+
+def test_the_status_screen_labels_its_language_and_tip():
+    """语言与提示也走「标签 + 内容」的形式，跟其它行一致。"""
+    start_plugin(config={"patterns": [LIVE], "language": "en_us"}, state=None)
+    source = FakeSource()
+    slf._show_status(source)          # 不要再调 _status_text()：它会重新启动插件
+    text = str(source.replies[0])
+
+    assert "Language: en_us (set in the config)" in text, text
+    assert "Note: the server's own log is unaffected" in text, text
+
+
+def test_a_single_digit_rule_index_has_no_padding():
+    """``[ 1]`` 里那个空格是给两位数对齐用的，只有 9 条以内时它是纯噪音。"""
+    rows = [l for l in str(_status_text()).splitlines() if l.startswith(" [")]
+    assert len(rows) == 1, rows
+    assert rows[0].startswith(" [1]"), rows[0]
+
+
+def test_two_digit_rule_indices_still_line_up():
+    """10 条以上才补空格——这时它真的买到了对齐。"""
+    patterns = [LIVE] + ["noise-{:03d}-\\w+".format(i) for i in range(1, 12)]
+    rows = [l for l in str(_status_text(rules=patterns)).splitlines() if l.startswith(" [")]
+    assert len(rows) == 12, len(rows)
+
+    assert rows[0].startswith(" [ 1]"), rows[0]
+    assert rows[-1].startswith(" [12]"), rows[-1]
+    assert len({r.index("]") for r in rows}) == 1, "两位数时 ] 必须对齐"
+
+    # 「一次都没命中就删掉」的规则也要能看出编号是连续的
+    assert [r.split("]")[0].strip(" [") for r in rows] == [str(i) for i in range(1, 13)]
+
+
+# ---------------------------------------------------------------------------
+#  17. 打包时剥掉注释（仓库里保留）
+# ---------------------------------------------------------------------------
+
+def _packaged_member(name, tmp_path):
+    """The packaged bytes of one member, built through the real packer."""
+    out, _ = _build_package(tmp_path)
+    with zipfile.ZipFile(out) as zf:
+        return zf.read(name)
+
+
+def test_the_packaged_code_carries_no_comments_or_docstrings(tmp_path):
+    """注释留仓库、不进包——这一条把「不进包」钉死。"""
+    import io as _io
+    import tokenize
+
+    for name in ("server_log_filter/__init__.py", "server_log_filter/i18n.py"):
+        source = _packaged_member(name, tmp_path).decode("utf-8")
+
+        comments = [t for t in tokenize.generate_tokens(_io.StringIO(source).readline)
+                    if t.type == tokenize.COMMENT]
+        assert not comments, "{} 里还有注释: {}".format(name, comments[:2])
+
+        tree = ast.parse(source)
+        left = [n for n in ast.walk(tree)
+                if isinstance(n, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+                and ast.get_docstring(n, clean=False)]
+        assert not left, "{} 里还有 docstring: {}".format(name, [n.name for n in left][:3])
+
+        compile(source, name, "exec")          # 剥完还得能编译
+
+
+def test_stripping_keeps_line_numbers_so_tracebacks_still_match(tmp_path):
+    """包内代码的行号必须与仓库一致，否则报错行号会对不上源码。"""
+    for name in ("server_log_filter/__init__.py", "server_log_filter/i18n.py"):
+        repo_lines = (pathlib.Path(__file__).resolve().parent.parent / name).read_text(
+            encoding="utf-8").count("\n")
+        assert _packaged_member(name, tmp_path).decode("utf-8").count("\n") == repo_lines, name
+
+
+def test_stripping_does_not_eat_a_hash_inside_a_string():
+    """用 tokenize 而不是正则，就是为了这个：字符串里的 # 不是注释。"""
+    import pack
+
+    source = 'x = "url#fragment"  # real comment\ny = "a # b"\n'
+    stripped = pack._blank_comments(source)
+
+    assert '"url#fragment"' in stripped, stripped
+    assert '"a # b"' in stripped, stripped
+    assert "real comment" not in stripped, stripped
+
+
+def test_a_docstring_only_body_becomes_pass_and_still_compiles():
+    """函数体只有一句 docstring 时，剥完必须补 pass，否则语法错误。"""
+    import pack
+
+    source = 'def f():\n    """only a docstring"""\n\ndef g():\n    """doc"""\n    return 1\n'
+    stripped = pack._blank_docstrings(source)
+
+    assert "only a docstring" not in stripped, stripped
+    compile(stripped, "<stripped>", "exec")
+    assert "pass" in stripped.split("def g")[0], stripped
