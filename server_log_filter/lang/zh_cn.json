@@ -29,6 +29,7 @@
 
   "broken.json_error": "JSON 语法错误：{error}",
   "broken.not_an_object": "顶层应为 JSON 对象，实际是 {kind}",
+  "broken.not_utf8": "文件不是合法的 UTF-8 文本（常见原因：在 Windows 上用记事本以 ANSI/GBK 编码保存）",
   "broken.backup_failed": "[ServerLogFilter] 配置文件无法解析，但备份到 {file}.old 也失败了（{error}）。原文件可能已被重置，请注意保存。",
   "broken.title": "[ServerLogFilter] 配置文件无法解析，已重置为默认配置",
   "broken.file_line": "  · 出问题的文件：{path}",
@@ -57,12 +58,16 @@
   "status.rule_count": "规则数: ",
   "status.hidden_now": "    本次已隐去: ",
   "status.lines": " 行",
+  "status.language_auto": "语言：{code}（跟随 MCDR）",
+  "status.language_set": "语言：{code}（配置指定）",
   "status.no_rules": "（无规则，请在配置文件 patterns 里填写）",
   "status.rule_index": " [{index:>2}] ",
   "status.rule_hits": "{count:>5} 次  ",
   "status.streak_warn": "   ⚠ 连续 {streak} 次开服零命中",
   "status.streak": "   （连续 {streak} 次零命中）",
+  "status.last_hit": "   （上次命中：第 {session} 个开服周期）",
   "status.sessions": "已统计 {count} 个开服周期",
+  "status.rejected": "有 {count} 条规则已被跳过（正则写错或回溯风险，原因见 MCDR 日志）",
   "status.tip": "提示: 服务端自身日志不受影响；被隐去的行仍会正常派发给插件事件。",
   "reload.done": "已重载日志过滤规则",
   "reload.count": "（当前 {count} 条）",
@@ -73,6 +78,7 @@
   "test.hit_detail": "    命中规则: ",
   "test.miss": "不会被隐去",
   "test.miss_detail": "    该行不匹配任何规则",
+  "test.stripped_note": "（已剥掉 [时间] [线程/级别]: 前缀，按真正参与匹配的正文测试）",
 
   "config_doc.language": "消息语言。auto = 跟随 MCDR 当前 config.yml 里的 language 设置；也可写 zh_cn / en_us。",
   "config_doc.patterns": "要隐去的日志。正则列表，一行命中任意一条就不在 MCDR 控制台显示（服务端自身日志文件不受影响）。",
@@ -81,7 +87,7 @@
   "config_doc.warn_about_stale_rules": "true 时，某条规则连续多个开服周期零命中会提醒一次，便于清理失效规则。",
   "config_doc.stale_rule_threshold": "连续多少个开服周期零命中才提醒。设成 0 可关闭该提醒。",
   "config_doc.validate_patterns": "true 时在载入时拦下会拖死主线程的危险正则（如 (a+)+$）并在日志报错。",
-  "config_doc.pattern_probe_timeout_ms": "上面那项检查的耗时上限（毫秒）。正常规则约 1 µs，一般无需改动。",
+  "config_doc.pattern_probe_timeout_ms": "上面那项检查的耗时上限（毫秒）。正常规则约 1 µs，一般无需改动。小于 1 会按 1 处理。",
   "config_doc.announce_config_upgrade": "true 时，插件更新后若配置被自动补齐，会在控制台列出本次新增的选项。",
   "config_doc.announce_broken_config": "true 时，配置文件解析失败被备份并重置时，会在控制台说明原因与备份路径。"
 }

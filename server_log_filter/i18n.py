@@ -183,9 +183,11 @@ def translate(key: str, language: str = FALLBACK_LANGUAGE, **kwargs: Any) -> str
         return template
     try:
         return template.format(**kwargs)
-    except (KeyError, IndexError, ValueError):
+    except (KeyError, IndexError, ValueError, AttributeError, TypeError):
         # A translation that lost or misspelled a placeholder is a bug in that file, not
         # a reason to fail the caller: show it as written so the mistake is visible.
+        # AttributeError matters too: ``{a.b}`` in a translation is a plain typo, and it
+        # would otherwise escape this function and contradict the promise above.
         return template
 
 

@@ -314,17 +314,29 @@ def _build_rules(
     probe_budget_ms: int = 25,
 ) -> List[Rule]:
     """编译规则；单条写错不影响其他规则，只在日志里报错或警告。"""
+    global _rejected_patterns
+
+    # 预算 <= 0 会把**每一条**规则都判成「太慢」→ 过滤静默失效、报错还指向「回溯风险」
+    # 这个错误的方向。夹到 1 ms：真实规则在微秒级、危险模式在百毫秒级，两边都分得清。
+    if validate:
+        probe_budget_ms = max(1, probe_budget_ms)
+
     rules: List[Rule] = []
+    _rejected_patterns = []
     for raw in patterns:
         pattern = (raw or "").strip()
         if not pattern:
             continue
         try:
             regex = re.compile(pattern)
-        except re.error as error:
+        except (re.error, OverflowError, RecursionError) as error:
+            # re.error 不是唯一的失败方式：`a{999999999999}` 抛 OverflowError、
+            # 上千层嵌套抛 RecursionError。只接 re.error 的话，一个打错的量化符
+            # 就能把整个 on_load 带下去——而这条路径的承诺是「单条写错不影响其他规则」。
             server.logger.warning(
                 _t("rule.compile_failed", pattern=pattern, error=error)
             )
+            _rejected_patterns.append(pattern)
             continue
         if validate:
             problem = _probe_pattern(regex, probe_budget_ms)
@@ -341,6 +353,7 @@ def _build_rules(
                         ),
                     )
                 )
+                _rejected_patterns.append(pattern)
                 continue
         rules.append(Rule(pattern, regex))
     return rules
@@ -359,6 +372,13 @@ _server: Optional[PluginServerInterface] = None
 
 # 本次加载解析出的语言，所有消息经 _t() 走它；读到配置前它是回落链的终点。
 _language: str = i18n.FALLBACK_LANGUAGE
+
+# 用户当初写的 setting（可能仍是 ``auto``）；只用来在 !!logfilter 里说明语言来源。
+_language_setting: str = i18n.AUTO
+
+# 本次载入被跳过的规则（正则写错、或触发回溯保护），供 !!logfilter 说明
+# 「为什么启用的条数比配置里少」。
+_rejected_patterns: List[str] = []
 
 # 只有完成过启动的周期才计入「零命中」统计，否则连续启动失败会刷出假提醒。
 _session_reached_startup = False
@@ -428,12 +448,27 @@ def _resolve_language(server: PluginServerInterface, setting, warn: bool = True)
     return choice.language
 
 
-def _read_text_file(path: str) -> Optional[str]:
-    """读一个文本文件，读不动就返回 None（不抛异常）。"""
+def _read_bytes(path: str) -> Optional[bytes]:
+    """把文件整个读成字节；读不动（权限之类）返回 None。"""
     try:
-        with open(path, encoding="utf-8") as handle:
+        with open(path, "rb") as handle:
             return handle.read()
     except OSError:
+        return None
+
+
+def _decode_utf8(data: Optional[bytes]) -> Optional[str]:
+    """按 UTF-8 解码，不是合法 UTF-8 就返回 None。
+
+    配置里可以写中文规则，所以「解码不了」和语法错误一样属于把配置写坏了：
+    调用方要照常备份 + 重置，而不是让 UnicodeDecodeError 冒到 on_load 把插件打下来
+    （它继承自 ValueError，不会被 ``except OSError`` 拦住）。
+    """
+    if data is None:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
         return None
 
 
@@ -501,18 +536,21 @@ def _load_config(server: PluginServerInterface) -> Config:
 
     开关只决定说不说：``announce_config_upgrade`` 关掉也照补配置。
     """
-    global _newly_added_options, _config_was_reset, _language
+    global _newly_added_options, _config_was_reset, _language, _language_setting
 
     _newly_added_options = []
-    raw = _read_text_file(os.path.join(server.get_data_folder(), CONFIG_FILE_NAME))
-    _config_was_reset = _quarantine_broken_config(server, CONFIG_FILE_NAME, raw) is not None
+    data = _read_bytes(os.path.join(server.get_data_folder(), CONFIG_FILE_NAME))
+    _config_was_reset = _quarantine_broken_config(server, CONFIG_FILE_NAME, data) is not None
     config = server.load_config_simple(target_class=Config, data_processor=_config_migrator)
 
     setting = config.language
-    if _config_was_reset and raw is not None:
+    if _config_was_reset:
         # 配置刚被重置成默认值（language 也是默认的 auto），但用户当初明明写了自己的
         # 选择；那份选择只剩原文里有，读它才不至于「修配置过程中语言突然变了」。
-        setting = _raw_str_option(raw, LANGUAGE_OPTION) or setting
+        raw = _decode_utf8(data)
+        if raw is not None:
+            setting = _raw_str_option(raw, LANGUAGE_OPTION) or setting
+    _language_setting = setting
     _language = _resolve_language(server, setting)
 
     if config.announce_config_upgrade:
@@ -549,40 +587,48 @@ def _raw_str_option(raw: str, name: str) -> Optional[str]:
 
 
 def _quarantine_broken_config(
-    server: PluginServerInterface, file_name: str, raw: Optional[str] = None
+    server: PluginServerInterface, file_name: str, data: Optional[bytes] = None
 ) -> Optional[str]:
     """配置解析失败时先把它挪到 ``<name>.old``，并把解析错误说明返回给上层。
 
     必须在交给 MCDR 之前自己看一遍：``load_config_simple`` 默认 ``failure_policy
-    ='regen'``，会直接用默认值覆盖原文件，用户写的规则就此消失。
-    备份永远执行，``announce_broken_config`` 只管说不说；开关与语言都只能从
-    原文里读（此刻没有解析好的配置）。
+    ='regen'``，会直接用默认值覆盖原文件，用户写的规则就此消失。三种「写坏」都在
+    这里拦下——JSON 语法错误、顶层不是对象、以及**不是合法的 UTF-8**（后者同样会让
+    MCDR 解析失败，所以也得先备份）。备份永远执行，``announce_broken_config`` 只管
+    说不说；开关与语言只能从原文里读（此刻没有解析好的配置）。
     """
     path = os.path.join(server.get_data_folder(), file_name)
     if not os.path.isfile(path):
         return None
 
-    if raw is None:
-        raw = _read_text_file(path)
-        if raw is None:
+    if data is None:
+        data = _read_bytes(path)
+        if data is None:
             return None  # 读不动（权限之类）就交给 MCDR 自己处理
 
-    try:
-        data = json.loads(raw)
-    except ValueError as error:
-        reason = _t("broken.json_error", error=error)
-    else:
-        if isinstance(data, dict):
-            return None
-        reason = _t("broken.not_an_object", kind=type(data).__name__)
+    raw = _decode_utf8(data)
 
-    # 语言只能从原文取；warn=False，让紧接着的 _load_config 去发那唯一的警告。
-    language = _resolve_language(
-        server, _raw_str_option(raw, LANGUAGE_OPTION) or i18n.AUTO, warn=False
-    )
+    # 语言得先定：下面那句「哪里出错了」也要用它。此刻只能从原文里取，取不到就问
+    # MCDR（auto 的语义）。这里不发声，让紧接着的 _load_config 去发那唯一的警告。
+    setting = i18n.AUTO
+    if raw is not None:
+        setting = _raw_str_option(raw, LANGUAGE_OPTION) or i18n.AUTO
+    language = _resolve_language(server, setting, warn=False)
 
     def say(key: str, **kwargs) -> str:
         return i18n.translate(key, language, **kwargs)
+
+    if raw is None:
+        reason = say("broken.not_utf8")
+    else:
+        try:
+            parsed = json.loads(raw)
+        except ValueError as error:
+            reason = say("broken.json_error", error=error)
+        else:
+            if isinstance(parsed, dict):
+                return None
+            reason = say("broken.not_an_object", kind=type(parsed).__name__)
 
     backup = path + CONFIG_BACKUP_SUFFIX
     try:
@@ -594,7 +640,7 @@ def _quarantine_broken_config(
         )
         return reason
 
-    if _raw_bool_option(raw, BROKEN_CONFIG_NOTICE_OPTION) is False:
+    if _raw_bool_option(raw or "", BROKEN_CONFIG_NOTICE_OPTION) is False:
         return reason  # 灯关了：备份照做，只是不再播报
 
     shown_path = "{}/{}".format(_CONFIG_FOLDER_DISPLAY, file_name)
@@ -748,12 +794,14 @@ def _emit_stale_warning(
 
 
 def on_load(server: PluginServerInterface, prev_module) -> None:
-    global _config, _log_filter, _state, _server, _session_reached_startup, _language
+    global _config, _log_filter, _state, _server, _session_reached_startup
+    global _language, _language_setting
 
     _server = server
 
     if InfoActionFlag is None:
         # 还没有配置可读，语言只能问 MCDR 自己；然后放弃注册，避免每行都抛异常。
+        _language_setting = i18n.AUTO
         _language = i18n.resolve(i18n.AUTO, _mcdr_language(server)).language
         server.logger.error(_t("plugin.requires_mcdr", version=MIN_MCDR_VERSION))
         return
@@ -884,6 +932,10 @@ def _show_status(source) -> None:
         return
 
     rules = _log_filter.rules
+    if i18n.normalize(_language_setting) in ("", i18n.AUTO):
+        language_line = _t("status.language_auto", code=_language)
+    else:
+        language_line = _t("status.language_set", code=_language)
     parts = RTextList(
         RText(_t("status.header"), RColor.aqua),
         "\n",
@@ -892,6 +944,8 @@ def _show_status(source) -> None:
         RText(_t("status.hidden_now"), RColor.gray),
         RText(str(_log_filter.total), RColor.green),
         RText(_t("status.lines"), RColor.gray),
+        "\n",
+        RText(language_line, RColor.dark_gray),
     )
 
     if not rules:
@@ -905,6 +959,13 @@ def _show_status(source) -> None:
         parts.append(RText(_t("status.rule_hits", count=rule.count), RColor.green))
         parts.append(RText(rule.pattern, RColor.white))
         entry = _state.rules.get(rule.pattern) if _state is not None else None
+        if entry is not None and entry.last_hit_session:
+            parts.append(
+                RText(
+                    _t("status.last_hit", session=entry.last_hit_session),
+                    RColor.dark_gray,
+                )
+            )
         if entry is not None and entry.zero_streak:
             if threshold and entry.zero_streak >= threshold:
                 parts.append(
@@ -914,6 +975,12 @@ def _show_status(source) -> None:
                 parts.append(
                     RText(_t("status.streak", streak=entry.zero_streak), RColor.dark_gray)
                 )
+
+    if _rejected_patterns:
+        parts.append("\n")
+        parts.append(
+            RText(_t("status.rejected", count=len(_rejected_patterns)), RColor.yellow)
+        )
 
     if _state is not None and _state.session_index:
         parts.append("\n")
@@ -966,25 +1033,33 @@ def _reset_streaks(source) -> None:
     )
 
 
+# 控制台整行的前缀（``[12:00:00] [Server thread/INFO]: ``）。过滤器匹配的是 MCDR
+# **剥掉前缀之后**的正文，而管理员习惯整行复制，所以 !!logfilter test 也得先剥掉，
+# 否则 ``^`` 锚定的规则会被误报成「不命中」——人会去改本来写对的规则。
+_LOG_LINE_PREFIX = re.compile(r"^\[[^\]]*\]\s*\[[^\]]*\]\s*:\s?")
+
+
 def _test_line(source, context) -> None:
     if _log_filter is None:
         source.reply(RText(_t("cmd.not_initialised"), RColor.red))
         return
 
     text = context["text"]
-    rule = _log_filter.match(text)
+    body = _LOG_LINE_PREFIX.sub("", text, count=1) or text
+    rule = _log_filter.match(body)
+
     if rule is None:
-        source.reply(
-            RTextList(
-                RText(_t("test.miss"), RColor.green),
-                RText(_t("test.miss_detail"), RColor.gray),
-            )
+        reply = RTextList(
+            RText(_t("test.miss"), RColor.green),
+            RText(_t("test.miss_detail"), RColor.gray),
         )
     else:
-        source.reply(
-            RTextList(
-                RText(_t("test.hit"), RColor.yellow),
-                RText(_t("test.hit_detail"), RColor.gray),
-                RText(rule.pattern, RColor.white),
-            )
+        reply = RTextList(
+            RText(_t("test.hit"), RColor.yellow),
+            RText(_t("test.hit_detail"), RColor.gray),
+            RText(rule.pattern, RColor.white),
         )
+    if body != text:
+        reply.append("\n")
+        reply.append(RText(_t("test.stripped_note"), RColor.dark_gray))
+    source.reply(reply)
