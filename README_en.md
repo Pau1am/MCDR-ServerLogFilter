@@ -70,7 +70,9 @@ Running several backends? Put one copy in each — configurations are independen
     "warn_about_stale_rules": true,
     "stale_rule_threshold": 3,
     "validate_patterns": true,
-    "pattern_probe_timeout_ms": 25
+    "pattern_probe_timeout_ms": 25,
+    "announce_config_upgrade": true,
+    "announce_broken_config": true
 }
 ```
 
@@ -83,6 +85,8 @@ Running several backends? Put one copy in each — configurations are independen
 | `stale_rule_threshold` | `int` | `3` | How many consecutive idle sessions before warning. `0` disables the warning |
 | `validate_patterns` | `bool` | `true` | Check rules for catastrophic backtracking at load time — see below |
 | `pattern_probe_timeout_ms` | `int` | `25` | Time budget for that check, in milliseconds. Rarely needs changing |
+| `announce_config_upgrade` | `bool` | `true` | Say which options were filled in after an upgrade — see below |
+| `announce_broken_config` | `bool` | `true` | Say why a broken config was reset, and where the backup went — see below |
 
 > **Matching uses `re.search` (substring match), not full match.**
 > Writing `standing on air` matches the whole line — no `.*` needed.
@@ -102,9 +106,11 @@ plugin now reports it in the log:
   · warn_about_stale_rules  （v1.1.0 加入）
       ...
   配置文件：config/server_log_filter/config.json
-  每一项的用途与加入版本都写在该项正上方的 "#选项名" 字段里。
+  Each option is described in the table above.
 ==================================================================
 ```
+
+Prefer quiet? Set `announce_config_upgrade` to `false` — see "Turning the notices off" below.
 
 One side note: a **mistyped** option name is also treated as redundant and removed. Your config
 therefore never accumulates dead entries — but a typo fails silently rather than erroring, so run
@@ -139,6 +145,10 @@ no restart needed.
 Also treated as broken: an empty file, or a file whose top level is not a JSON object
 (say, the whole file is an array).
 
+To skip that report, set `announce_broken_config` to `false`. **The backup still happens** —
+only the message is silenced. The one exception is the "even the backup failed" error, which
+announces imminent data loss and always gets through.
+
 ### Idle-rule reminder
 
 If a rule matches nothing for several consecutive sessions, it is most likely dead weight:
@@ -164,6 +174,12 @@ Worth knowing:
   per-line filtering path gains no extra work. Its purpose is keeping the config honest.
 - The history lives in `config/server_log_filter/state.json`, separate from the `config.json`
   you edit. The plugin never touches your config.
+- **Delete a rule and its history goes with it.** After editing `patterns`, run
+  `!!logfilter reload` (or `!!MCDR reload plugin server_log_filter`) and the statistics for
+  the rules you removed are cleared straight away — no need to wait for the next
+  start/stop cycle. The plugin logs exactly which rules it forgot. Rules that are still in
+  `patterns` but simply have not matched yet are untouched: only rules **actually removed
+  from the config** are forgotten.
 - If a rule is legitimately rare (fires once a month, say), raise `stale_rule_threshold`, or
   use `!!logfilter reset` to clear the counters and start observing again.
 - Only sessions that actually **finished starting** are counted, so a server that fails to boot
@@ -183,6 +199,27 @@ with a clear error:
 The check runs once at load; realistic patterns cost microseconds, and a refused rule never
 affects the others. Leave `validate_patterns` on unless you know exactly what you are doing.
 
+### Turning the notices off
+
+Each of the three notices above has its own switch, all on by default:
+
+| Notice | Switch | What turning it off does |
+|---|---|---|
+| Options filled in after an upgrade | `announce_config_upgrade` | The config is **still** completed and written back — it just stops saying so |
+| Broken config reset | `announce_broken_config` | The broken file is **still** preserved as `config.json.old` and rebuilt — it just stops saying so |
+| Rule idle for several sessions | `warn_about_stale_rules` | The statistics are **still** recorded in `state.json` — it just stops reminding you |
+
+**A switch governs the message, never the work.** All three safety behaviours (completing the
+config, backing up a broken file, recording statistics) keep running with every notice off.
+
+Two details worth knowing:
+
+- When the config fails to parse, the value of `announce_broken_config` can only be read **from
+  your own file** — there is no parsed config left to ask. It therefore works even when written
+  after the syntax error, and `false` really does silence the report.
+- A reset config is replaced by defaults, so the switch **returns to `true`** at that point.
+  Fix the file, and if you want quiet you will need to set it to `false` again.
+
 ## Commands
 
 | Command | Permission | Description |
@@ -190,7 +227,7 @@ affects the others. Leave `validate_patterns` on unless you know exactly what yo
 | `!!logfilter` | user | Show status: rule count, per-rule hits and idle streaks |
 | `!!logfilter list` | user | Same as above |
 | `!!logfilter test <text>` | user | Check whether a line would be hidden, and which rule matches |
-| `!!logfilter reload` | admin | Re-read the config file and apply it immediately |
+| `!!logfilter reload` | admin | Re-read the config file and apply it immediately; also forgets rules removed from it |
 | `!!logfilter reset` | admin | Clear the idle-session counters and start observing again |
 
 `!!logfilter test` is especially handy: paste a line from your log to verify the rule without waiting for it to actually fire.

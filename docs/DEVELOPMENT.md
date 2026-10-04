@@ -22,7 +22,7 @@ MCDR-ServerLogFilter/
 ├── mcdreforged.plugin.json    插件元数据
 ├── server_log_filter/         代码子包（与插件 id 同名）
 │   └── __init__.py
-├── CHANGELOG.md               变更记录（随发布包分发）
+├── CHANGELOG.md               变更记录，只留最新一版（随发布包分发）
 ├── LICENSE
 ├── README.md / README_en.md   主文档，面向使用者（不打包）
 ├── docs/DEVELOPMENT.md        本文件（不打包）
@@ -46,10 +46,15 @@ python pack.py            # 生成 ServerLogFilter-v<版本号>.mcdr
 |---|---|
 | `mcdreforged.plugin.json` | 插件元数据（必需） |
 | `server_log_filter/__init__.py` | 插件代码 |
-| `CHANGELOG.md` | 变更记录，随包分发 |
+| `CHANGELOG.md` | 变更记录，**只含最新一个版本**，随包分发 |
 | `LICENSE` | MIT 许可证 |
 
 两个 README **不打包**：MCDR 从不读取它们，内容与 Releases 页面重复，而去掉后产物体积几乎减半。
+
+> **`CHANGELOG.md` 只保留最新版本一节**，旧条目在发新版本时删掉（全文留在 Releases 页面上）。
+> 它与包一起分发，任何一个历史条目都会**永久**占着用户的体积——实测 1.2.0 → 1.2.1
+> 涨的 10.3% 全部来自它自己变长。`test_changelog_keeps_only_the_latest_release`
+> 钉住这一点：必须恰好只有一节，且版本号等于 `mcdreforged.plugin.json` 里的当前版本。
 
 > **为什么必须用白名单？** 早期版本的这一节用的是 `rglob("*")` 加一个很短的 `skip` 列表，
 > 那是**黑名单**思路，会被仓库里任何新文件悄悄带进发布包。两个具体后果：
@@ -75,7 +80,7 @@ python -m pip install --target .testlibs -r tests/requirements-test.txt
 PYTHONPATH=.testlibs python -m pytest tests -v     # Windows: $env:PYTHONPATH=".testlibs"
 ```
 
-当前 **148 个用例**，分三层：
+当前 **174 个用例**，分三层：
 
 | 层 | 位置 | 说明 |
 |---|---|---|
@@ -86,7 +91,7 @@ PYTHONPATH=.testlibs python -m pytest tests -v     # Windows: $env:PYTHONPATH=".
 另有两个工具：
 
 ```bash
-python tools/mutation_check.py    # 故意改坏实现，确认测试会变红（14 个变异，14/14 应被抓住）
+python tools/mutation_check.py    # 故意改坏实现，确认测试会变红（20 个变异，20/20 应被抓住）
 python benchmarks/bench_filter.py # 性能基准，README / CHANGELOG 里引用的数字都由它产出
 ```
 
@@ -114,12 +119,19 @@ python tools/mcdr_matrix.py --current
 - 非法正则被跳过且产生警告，不影响其他规则
 - 近乎相同但不同的行**不**命中（证明不是无脑全过滤）
 - **零命中提醒**：达阈值才提醒、命中即归零、启动失败的周期不计入、热重载不误判、
+  **规则从配置删除后其统计立刻清除**（重载时即清，不必等服务端停止；
+  仍写在配置里但被跳过的规则不受影响；配置刚被自动重置时不动状态文件）、
   可从配置关闭、`reset` 能清空、提醒内容不重复
 - **正则安全检查**：4 类灾难性回溯模式被拦下，8 种真实写法全部放行
 - **升级提示与迁移**：旧版本格式的配置在真实 MCDR 上自动补齐，并在日志里报告新增了哪些选项；
-  每个配置项都必须写明加入版本，且说明必须**紧挨在选项正上方一行**（均有测试保证）
+  每个配置项都必须写明加入版本与说明（有测试保证，漏写就会变红）
 - **坏配置保全**：解析失败时原文件被备份为 `config.json.old`，新配置以默认值重建，
   并在日志里给出原因与出错行列；空文件、顶层非对象同样处理
+- **三条提示的开关**（`announce_config_upgrade` / `announce_broken_config` /
+  `warn_about_stale_rules`，默认全开）：关掉只影响**说不说**，不影响**做不做**——
+  配置照补、坏文件照备份、统计照记。写坏配置时开关只能从**原文**里读（配置已解析失败），
+  因此大小写、空格、写在校验错误之前或之后都有效；「连备份都失败」属数据丢失警告，
+  不受开关影响。以上每条都有单测 + 真实 MCDR 端到端各验一遍
 
 ### 端到端（真实 MCDR + 假服务端，跑完整生命周期）
 
@@ -136,7 +148,7 @@ python tools/mcdr_matrix.py --current
 插件日志：
 
 ```
-插件 server_log_filter@1.1.0 已加载
+插件 server_log_filter@<版本> 已加载
 已启用 1 条日志过滤规则；命中后仅从 MCDR 控制台隐去，服务端日志不受影响
 本次运行共从 MCDR 控制台隐去 3 行服务端日志（服务端日志文件不受影响）
 ```
@@ -153,7 +165,8 @@ python tools/mcdr_matrix.py --current
 并且**真的没有出现在控制台上**，同时**事件仍然照常派发**。
 如果未来 MCDR 改变 `hidden()` 的语义，测试会直接失败，而不是让插件在服务器上静默出问题。
 
-端到端组共用一个 MCDR 实例（约 5～6 秒），可用 `MCDR_SKIP_E2E=1` 跳过。
+端到端组共有 6 次真实 MCDR 启动（正常一次、零命中提醒一次、坏配置一次、
+关掉写坏提示一次、删规则前后各一次），整个 `tests` 目录约 23 秒，可用 `MCDR_SKIP_E2E=1` 跳过。
 
 ## 环境要求的由来
 
@@ -193,7 +206,8 @@ Minecraft 侧：过滤发生在 MCDR 侧（对服务端 stdout 逐行匹配）�
 ## 发布流程
 
 1. 改动合入 `main`（对外动作前先征得维护者同意）
-2. 更新 `CHANGELOG.md` 与 `mcdreforged.plugin.json` 里的版本号
+2. 更新 `CHANGELOG.md` 与 `mcdreforged.plugin.json` 里的版本号；
+   同时**把 `CHANGELOG.md` 裁成只剩本次版本一节**（旧条目删除，Releases 里已有全文）
 3. 判定是否属于**实质更新**：只有用户拿到的东西变了（插件行为 / 配置项 / 命令 / 兼容性）
    才发新版本；纯测试、纯文档、纯打包脚本改动不发版本
 4. `python pack.py` 构建产物，并记下**该文件**的 SHA256

@@ -133,7 +133,12 @@ class FakePluginServer:
         return self.config
 
     def save_config_simple(self, config, file_name=None, **kwargs):
-        self.saved[file_name] = config.serialize()
+        data = config.serialize()
+        self.saved[file_name] = data
+        if file_name == slf.STATE_FILE_NAME:
+            # Mirror MCDR writing the file to disk: a later on_load in the same
+            # test reads it back, exactly like a plugin reload would.
+            self.state_data = data
 
 
 # The set of noisy lines this plugin exists to suppress (server side, MC 26.3).
@@ -350,6 +355,8 @@ def test_config_defaults_match_documented_json():
     assert data["stale_rule_threshold"] == 3
     assert data["validate_patterns"] is True
     assert data["pattern_probe_timeout_ms"] == 25
+    assert data["announce_config_upgrade"] is True
+    assert data["announce_broken_config"] is True
 
 
 def test_config_deserializes_from_json_like_dict():
@@ -606,6 +613,33 @@ def test_packager_ships_exactly_the_allowlist(tmp_path):
         assert excluded not in names, "{} must not be shipped".format(excluded)
 
 
+def test_changelog_keeps_only_the_latest_release():
+    """The shipped changelog must not accumulate one section per release.
+
+    CHANGELOG.md travels inside the artifact, so every past entry keeps costing
+    users bytes forever -- 1.2.0 -> 1.2.1 was +10.3%, all of it the changelog
+    growing. Only the newest entry belongs there; the full history stays on the
+    Releases page, where it has already been published.
+
+    Asserting the single heading *equals the current version* is what makes this
+    a real constraint: "at most one heading" is satisfied by an empty file too.
+    """
+    root = pathlib.Path(__file__).resolve().parent.parent
+    changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    meta = json.loads((root / "mcdreforged.plugin.json").read_text(encoding="utf-8"))
+
+    headings = re.findall(r"^## \[([^\]]+)\]", changelog, re.M)
+    assert headings == [meta["version"]], (
+        "CHANGELOG.md should document exactly the shipped version ({}), found {}".format(
+            meta["version"], headings
+        )
+    )
+
+    # no leftover link-reference definitions for the removed versions either
+    leftovers = re.findall(r"^\[\d+\.\d+\.\d+\]:", changelog, re.M)
+    assert leftovers == [], "stale version links left behind: {}".format(leftovers)
+
+
 def test_packager_keeps_artifact_small(tmp_path):
     """A stray .testlibs/ once blew this up to 1362 files / 7.11 MB."""
     out, names = _build_package(tmp_path)
@@ -855,6 +889,121 @@ def test_state_forgets_patterns_that_left_the_config():
     slf._apply_config(server)
     run_session(server)
     assert set(slf._state.rules) == {LIVE}, "removed patterns must be pruned from the state file"
+
+
+def state_rules_of(server):
+    return set(server.saved[slf.STATE_FILE_NAME]["rules"])
+
+
+def test_deleting_a_rule_prunes_its_state_immediately_on_plugin_reload():
+    """The admin should not have to wait for a whole server session.
+
+    Pruning used to happen only in on_server_stop, so a rule deleted and the
+    plugin reloaded stayed in state.json until the next successful shutdown.
+    """
+    server = start_plugin(config={"patterns": [LIVE, IDLE], "stale_rule_threshold": 1})
+    run_session(server)
+    assert state_rules_of(server) == {LIVE, IDLE}
+
+    server.config_data = {"patterns": [LIVE], "stale_rule_threshold": 1}
+    slf.on_load(server, None)          # !!MCDR reload plugin
+
+    assert state_rules_of(server) == {LIVE}, "the deleted rule must be gone right away"
+    assert IDLE not in slf._state.rules
+
+
+def test_deleting_a_rule_prunes_its_state_on_the_reload_command():
+    server = start_plugin(config={"patterns": [LIVE, IDLE], "stale_rule_threshold": 1})
+    run_session(server)
+
+    server.config_data = {"patterns": [LIVE], "stale_rule_threshold": 1}
+    source = FakeSource()
+    slf._reload(source)
+
+    assert state_rules_of(server) == {LIVE}
+    assert "已清除 1 条已删除规则的统计" in "".join(str(x) for x in source.replies)
+
+
+def test_pruning_does_not_touch_the_file_when_nothing_was_deleted():
+    """No change, no write: state.json must not be rewritten on every reload."""
+    server = start_plugin(config={"patterns": [LIVE, IDLE], "stale_rule_threshold": 1})
+    run_session(server)
+
+    server.saved.clear()
+    slf.on_load(server, None)
+
+    assert server.saved == {}, "an unchanged state must not be written back"
+
+
+def test_a_rule_rejected_by_the_safety_probe_keeps_its_history():
+    """Only rules whose text has actually left ``patterns`` may be forgotten.
+
+    Pruning must compare against the *configured* patterns, not the compiled
+    rules: a rule that is still written down but gets skipped at load time
+    (here, rejected by the catastrophic-backtracking guard after an upgrade)
+    is not a deletion, and starting its statistics over would be a regression.
+    """
+    danger = r"(a+)+$"
+    server = start_plugin(
+        config={
+            "patterns": [LIVE, danger],
+            "stale_rule_threshold": 1,
+            "validate_patterns": False,
+        }
+    )
+    run_session(server)
+    assert danger in slf._state.rules
+
+    # the same two patterns, but the probe is on now, so the dangerous one is skipped
+    server.config_data = {
+        "patterns": [LIVE, danger],
+        "stale_rule_threshold": 1,
+        "validate_patterns": True,
+    }
+    slf._apply_config(server)
+
+    assert all(rule.pattern != danger for rule in slf._log_filter.rules), "it is skipped"
+    assert danger in slf._state.rules, "still configured, so still remembered"
+
+
+def test_a_reset_config_does_not_wipe_the_rule_history(tmp_path):
+    """A syntax error must not cost the admin every rule's history.
+
+    When config.json is broken it is quarantined and regenerated with defaults, so
+    the patterns seen at that moment are *not* what the user configured. Pruning
+    against them would throw away statistics that are recoverable once the file is
+    restored by hand.
+    """
+    server, folder = server_with_config_file(tmp_path, BROKEN_JSON)
+    server.state_data = {
+        "session_index": 4,
+        "rules": {
+            LIVE: {"hits_last_session": 2, "zero_streak": 0, "total_hits": 9, "last_hit_session": 4},
+            IDLE: {"hits_last_session": 0, "zero_streak": 3, "total_hits": 0, "last_hit_session": 0},
+        },
+    }
+
+    slf.on_load(server, None)
+
+    assert set(slf._state.rules) == {LIVE, IDLE}, "the history must survive the reset"
+    assert slf.STATE_FILE_NAME not in server.saved, "nothing may be written back either"
+
+    # ...and the session-end cleanup must not quietly finish the job either
+    run_session(server, hits={LIVE: 1})
+    assert set(slf._state.rules) == {LIVE, IDLE}, "the history must survive the session too"
+
+
+def test_pruning_announces_what_it_removed():
+    server = start_plugin(config={"patterns": [LIVE, IDLE], "stale_rule_threshold": 1})
+    run_session(server)
+    server.logger.infos.clear()
+
+    server.config_data = {"patterns": [LIVE], "stale_rule_threshold": 1}
+    slf.on_load(server, None)
+
+    text = "\n".join(server.logger.infos)
+    assert "已从 state.json 清除 1 条规则统计" in text
+    assert IDLE in text, "the admin needs to know which rule was forgotten"
 
 
 def test_state_file_round_trips_through_json():
@@ -1215,6 +1364,7 @@ def test_migrator_reports_the_options_that_were_missing():
     assert slf._newly_added_options == [
         "log_matched_lines", "report_on_server_stop", "warn_about_stale_rules",
         "stale_rule_threshold", "validate_patterns", "pattern_probe_timeout_ms",
+        "announce_config_upgrade", "announce_broken_config",
     ]
 
 
@@ -1288,6 +1438,43 @@ def test_announcement_is_logged_exactly_once():
     server = FakePluginServer(config_data={"patterns": [LIVE]})
     slf.on_load(server, None)
     assert announce_output(server).count("配置已更新") == 1
+
+
+def test_upgrade_announcement_can_be_switched_off():
+    """``announce_config_upgrade = false`` silences the notice — and nothing else.
+
+    The switch governs the *speaking*, not the filling-in: MCDR still writes the
+    missing options into the file (that part is not ours to gate), the admin just
+    stops being told about it at every load.
+    """
+    server = FakePluginServer(
+        config_data={"patterns": [LIVE], "announce_config_upgrade": False}
+    )
+    slf.on_load(server, None)
+
+    assert "配置已更新" not in announce_output(server)
+    # the config still got completed — only the announcement is gone
+    assert set(slf._config.serialize()) == config_options()
+    assert slf._newly_added_options, "the missing options were still detected"
+
+
+def test_the_upgrade_switch_defaults_to_on():
+    server = FakePluginServer(config_data={"patterns": [LIVE]})
+    slf.on_load(server, None)
+    assert slf._config.announce_config_upgrade is True
+
+
+def test_the_upgrade_switch_survives_a_reload():
+    """Reloading with the switch off must stay quiet the second time too."""
+    config = {"patterns": [LIVE], "announce_config_upgrade": False}
+    server = start_plugin(config=config)
+    server.logger.infos.clear()
+
+    server.config_data = dict(config, validate_patterns=False)
+    slf._apply_config(server)
+
+    assert "配置已更新" not in announce_output(server)
+    assert slf._newly_added_options, "the reload should still have found new options"
 
 
 # ---------------------------------------------------------------------------
@@ -1451,3 +1638,80 @@ def test_quarantine_survives_an_unwritable_location(tmp_path, monkeypatch):
 
     assert reason is not None, "the problem is still reported"
     assert any("备份" in m for m in server.logger.errors)
+
+
+# ---------------------------------------------------------------------------
+#  12b. the notice switches for the broken-config path
+# ---------------------------------------------------------------------------
+
+def _broken_config_mentioning(line):
+    """``BROKEN_JSON`` with an extra line at the top — still unparseable.
+
+    The switch has to end up in the *raw text*: when the file cannot be parsed,
+    that text is the only place the admin's choice can be read from.
+    """
+    return BROKEN_JSON.replace("{\n", "{\n    " + line + "\n", 1)
+
+
+def test_the_broken_config_switch_is_a_real_option():
+    """Drift guard: the name the quarantine peeks for must exist on Config.
+
+    Renaming the field without renaming the constant would leave the switch
+    silently dead — it would be written to the file and never looked at.
+    """
+    assert slf.BROKEN_CONFIG_NOTICE_OPTION in slf.Config.get_field_annotations()
+
+
+def test_broken_config_notice_can_be_switched_off(tmp_path):
+    text = _broken_config_mentioning('"announce_broken_config": false,')
+    server, folder = server_with_config_file(tmp_path, text)
+
+    slf._quarantine_broken_config(server, slf.CONFIG_FILE_NAME)
+
+    assert server.logger.errors == [], "the notice was supposed to be silenced"
+    assert (folder / "config.json.old").is_file(), "the backup happens regardless"
+    assert not (folder / "config.json").exists()
+
+
+@pytest.mark.parametrize(
+    "line, announced",
+    [
+        ('"announce_broken_config": false,', False),
+        ('"announce_broken_config" :  false ,', False),   # layout is free-form
+        ('"announce_broken_config": FALSE,', False),      # a hand-written capital
+        ('"announce_broken_config": true,', True),
+        ('"announce_broken_config": "false",', True),     # a string is not a boolean
+        ('"announce_broken_configx": false,', True),      # a longer name is not a match
+        (None, True),                                     # absent -> default (on)
+    ],
+)
+def test_the_switch_is_read_leniently_from_the_raw_file(tmp_path, line, announced):
+    text = BROKEN_JSON if line is None else _broken_config_mentioning(line)
+    server, folder = server_with_config_file(tmp_path, text)
+
+    slf._quarantine_broken_config(server, slf.CONFIG_FILE_NAME)
+
+    assert bool(server.logger.errors) is announced, server.logger.errors
+    assert (folder / "config.json.old").is_file(), "the backup always happens"
+
+
+def test_raw_bool_option_finds_nothing_when_absent():
+    assert slf._raw_bool_option('{"a": true}', "b") is None
+
+
+def test_a_failed_backup_is_reported_even_with_the_notice_off(tmp_path, monkeypatch):
+    """Silencing a notice must not silence a *data-loss* error.
+
+    When the file cannot even be moved aside, MCDR is about to overwrite it in
+    place. That is not routine chatter, so it gets through the switch on purpose.
+    """
+    text = _broken_config_mentioning('"announce_broken_config": false,')
+    server, _ = server_with_config_file(tmp_path, text)
+
+    def boom(src, dst):
+        raise OSError("simulated")
+
+    monkeypatch.setattr(slf.os, "replace", boom)
+    slf._quarantine_broken_config(server, slf.CONFIG_FILE_NAME)
+
+    assert any("备份" in m for m in server.logger.errors), server.logger.errors

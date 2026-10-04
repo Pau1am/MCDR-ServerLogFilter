@@ -1,6 +1,6 @@
 # 测试 / Tests
 
-本目录是 Server Log Filter 的测试套件。**148 个用例**，覆盖过滤行为、配置、
+本目录是 Server Log Filter 的测试套件。**175 个用例**，覆盖过滤行为、配置、
 命令面、发布打包、**真实 MCDR 端到端**，以及本插件最核心的安全属性
 （被隐去的行仍保留 `process`，事件照常分发）。
 
@@ -34,7 +34,7 @@ $env:PYTHONPATH=".testlibs"; python -m pytest tests -v
 预期输出结尾：
 
 ```
-148 passed
+175 passed
 ```
 
 ## 覆盖内容
@@ -47,14 +47,15 @@ $env:PYTHONPATH=".testlibs"; python -m pytest tests -v
 | 配置对象 | 3 | 默认值与 README 文档一致；JSON 反序列化；往返稳定 |
 | MCDR 契约 | 2 | `InfoActionFlag.hidden()` 的常量构成；`InfoFilter` 允许改写 `action_flag` |
 | 命令面与元数据 | 8 | `on_load` 注册项；状态/测试/重载命令输出；`reload` 的 ADMIN 权限门禁；插件元数据与 `MIN_MCDR_VERSION` 同步 |
-| 发布打包 | 6 | 见下 |
-| **零命中提醒** | **16** | 阈值语义、命中归零、启动失败不计入、热重载不误判、可关闭、`reset`、历史持久化，**以及「不重复输出」**，见下 |
+| 发布打包 | 7 | 见下 |
+| **零命中提醒** | **22** | 阈值语义、命中归零、启动失败不计入、热重载不误判、可关闭、`reset`、历史持久化、**以及「不重复输出」**，见下；另含**删除规则后统计立刻清除**（重载 / 命令两条路径、不写多余文件、不误删被拦下的规则、配置被重置时不动） |
 | **灾难性回溯防护** | **21** | 8 种真实写法全部放行；4 类危险模式被拦下；开关与超时可配置且**确实接在 `on_load` 上** |
 | **轻量化不变量** | **6** | 热路径的结构性断言（缓存 `hidden()`、无规则短路、命中即停），外加两条宽松的耗时护栏 |
-| **升级提示与迁移** | **12** | 见下 |
+| **升级提示与迁移** | **15** | 见下；含**升级提示开关**本身的语义（关了不播、但配置照补） |
 | **坏配置的保全与重建** | **13** | 见下 |
-| **端到端（真实 MCDR）** | **20** | 见下 |
-| **合计** | **148** | |
+| **写坏提示的开关** | **11** | 开关从**写坏的原文**里读取（大小写 / 空格 / 位置随意、同名后缀不算、找不到按默认开启）；被静默的只有消息，备份照做；「连备份都失败」不受开关影响 |
+| **端到端（真实 MCDR）** | **26** | 见下 |
+| **合计** | **175** | |
 
 > 计数含 `@pytest.mark.parametrize` 展开后的用例数，与 `pytest --collect-only` 一致。
 
@@ -82,6 +83,8 @@ $env:PYTHONPATH=".testlibs"; python -m pytest tests -v
 | `test_only_the_idle_rule_is_flagged` | 本轮命中过的规则不会被牵连进提醒 |
 | `test_state_file_advances_by_one_session` | 关服后 `session_index` 与各规则的连续零命中次数被正确推进 |
 | `test_plugin_generated_its_default_config` | 首次运行生成 `config/server_log_filter/config.json`，字段与默认值正确 |
+| `test_a_deleted_rule_is_announced_as_cleaned_up` | **同一个实例目录跑两次 MCDR**，中间删掉一条规则；第二次启动时控制台出现「已清除」提示（这句只在载入阶段打印，因此能证明清理发生在重载那一刻） |
+| `test_a_deleted_rule_leaves_the_state_file` | 第二次运行后 `state.json` 里已无该规则，存活规则历史完好，`session_index == 2` |
 
 **这不是空断言**：把插件从 `plugins/` 拿掉后重跑，目标行回显 2 次，第 1 条用例会失败。
 
@@ -139,7 +142,7 @@ if handler.test_server_startup_done(info):
 
 ## 发布打包的回归防护
 
-`pack.py` 是仓库唯一的打包器，它的产物由这里 6 个用例把关：
+`pack.py` 是仓库唯一的打包器，它的产物由这里 7 个用例把关：
 
 - `test_packaged_artifact_is_loadable` —— 跑一遍 `pack.py`，把产物交给 **MCDR 自己的**
   `PackedPlugin._check_dir_legality` 校验
@@ -154,6 +157,9 @@ if handler.test_server_startup_done(info):
   `server_log_filter/sub/helper.py`，断言它**确实被打了进去**
 - `test_packager_root_entries_would_be_illegal_if_denylisted` —— 用真实的黑名单产物断言
   MCDR **确实会拒绝**它，防止有人把 `pack.py` "简化"回黑名单写法
+- `test_changelog_keeps_only_the_latest_release` —— `CHANGELOG.md` **恰好只有一节**，
+  且版本号等于 `mcdreforged.plugin.json` 里的当前版本（不含旧版本的链接定义）。
+  它随包分发，历史条目会永久占着用户的体积，所以旧条目在发新版时必须删掉
 
 这一节存在的直接原因：本测试套件自己的 `conftest.py` 位于仓库根目录，而 MCDR 禁止 `.mcdr`
 包含根级模块。如果打包器用 `rglob("*")` 加简短的排除列表（README 早期写法），产物会以
@@ -260,7 +266,7 @@ JSON 很严格，手工加规则时漏一个逗号就会解析失败，而 MCDR 
 python tools/mutation_check.py
 ```
 
-脚本会依次注入 14 个缺陷，要求相关用例变红；全绿即视为测试失效。已确认能被抓住的变异：
+脚本会依次注入 20 个缺陷，要求相关用例变红；全绿即视为测试失效。已确认能被抓住的变异：
 
 | 变异 | 抓住它的用例 |
 |---|---|
@@ -269,17 +275,21 @@ python tools/mutation_check.py
 | 去掉「必须完成启动」的保护 | `test_a_session_that_never_reached_startup_is_not_counted` |
 | 热重载计数接续失效 | `test_reload_does_not_fake_an_idle_session` |
 | 热重载丢失「本周期已完成启动」标记 | `test_reload_carries_the_running_session_over_to_the_new_module` |
-| 说明字段不再写入配置 | `test_migrator_asks_for_a_save_when_the_config_changes` 等 |
-| 说明字段不再声明为字段 | `test_doc_field_is_a_declared_field` 等 |
-| 把说明字段本身算作「新增选项」 | `test_migrator_reports_the_options_that_were_missing` |
-| 静默升级提示 | `test_upgrade_announcement_lists_options_with_versions` |
-| 某个配置项丢掉说明 | `test_every_config_option_is_documented` |
+| 配置里被塞进一个非选项键 | `test_the_generated_config_has_no_comment_fields` 等 |
+| 静默升级提示 | `test_upgrade_announcement_lists_options_with_versions` 等 |
+| 无视 `announce_config_upgrade`（关了照播） | `test_upgrade_announcement_can_be_switched_off`、`test_the_upgrade_switch_survives_a_reload` |
+| 无视 `announce_broken_config`（关了照播） | `test_broken_config_notice_can_be_switched_off`、`test_the_switch_is_read_leniently_from_the_raw_file` |
+| 某个配置项丢掉说明 | `test_every_config_option_has_a_description` |
 | 不再检查配置文件（坏文件被直接覆盖） | `test_on_load_checks_the_config_file` 等 |
 | 检测到问题但不备份 | `test_broken_config_is_backed_up_before_being_regenerated` |
 | 恢复成「每条规则都重复零命中次数」 | `test_a_rule_at_exactly_the_threshold_gets_no_annotation` 等 |
 | 不再提示配置已被重置 | `test_backup_announcement_says_what_where_and_why` |
 | 关闭灾难性回溯探测 | `test_on_load_actually_applies_the_probe` 等 |
 | 提醒时机提前到 `Done` 之前 | `test_stale_rule_warning_arrives_after_the_server_finished_starting` |
+| 载入时不再清理已删除规则的统计 | `test_deleting_a_rule_prunes_its_state_immediately_on_plugin_reload` 等 |
+| `!!logfilter reload` 不再清理已删除规则的统计 | `test_deleting_a_rule_prunes_its_state_on_the_reload_command` |
+| 孤立项按「编译成功的规则」而非配置原文判断 | `test_a_rule_rejected_by_the_safety_probe_keeps_its_history` |
+| 忽略「配置刚被自动重置」的保护 | `test_a_reset_config_does_not_wipe_the_rule_history` |
 
 > 教训留在这里：本套件的端到端组**曾经**声称能挡住 `hidden()` → `discarded()` 的回归，
 > 实测 6 条用例全部漏过，只有 2 条单元用例抓到。现在那条属性由

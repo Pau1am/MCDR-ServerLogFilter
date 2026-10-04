@@ -118,14 +118,18 @@ def drop_config_descriptions(src):
     )
 
 
-QUARANTINE_CALL = "    _quarantine_broken_config(server, CONFIG_FILE_NAME)\n"
+QUARANTINE_CALL = (
+    "    _config_was_reset = _quarantine_broken_config(server, CONFIG_FILE_NAME) is not None\n"
+)
 
 DOC_SUFFIX_LINE = '            suffix = "   （已连续 {} 次零命中）".format(entry.zero_streak)\n'
 DOC_SUFFIX_GUARD = "        if entry.zero_streak > threshold:\n"
 
 def drop_quarantine_call(src):
     """不再检查配置文件 —— 坏文件会被 MCDR 直接覆盖，用户的规则就此消失。"""
-    return src.replace(QUARANTINE_CALL, "    pass  # mutation: no quarantine\n")
+    return src.replace(
+        QUARANTINE_CALL, "    _config_was_reset = False  # mutation: no quarantine\n"
+    )
 
 def drop_backup_move(src):
     """检测到了问题，但不真的备份。"""
@@ -144,8 +148,24 @@ def repeat_streak_for_every_rule(src):
 def silence_upgrade_announcement(src):
     """不再报告配置里新增了哪些选项（升级悄悄发生）。"""
     return src.replace(
-        "    _announce_new_options(server)\n    return config",
-        "    return config  # mutation: upgrade not announced",
+        "    if config.announce_config_upgrade:\n        _announce_new_options(server)\n",
+        "    pass  # mutation: upgrade not announced\n",
+    )
+
+def ignore_the_upgrade_switch(src):
+    """无视 announce_config_upgrade —— 关了也照样播报。"""
+    return src.replace(
+        "    if config.announce_config_upgrade:\n",
+        "    if True:  # mutation: upgrade switch ignored\n",
+        1,
+    )
+
+def ignore_the_broken_config_switch(src):
+    """无视 announce_broken_config —— 关了也照样播报。"""
+    return src.replace(
+        "    if _raw_bool_option(raw, BROKEN_CONFIG_NOTICE_OPTION) is False:\n",
+        "    if False:  # mutation: broken-config switch ignored\n",
+        1,
     )
 
 def silence_reset_announcement(src):
@@ -155,10 +175,34 @@ def silence_reset_announcement(src):
         return src
     return src.replace(anchor, "    return reason  # mutation: reset not announced\n" + anchor, 1)
 
+
+PRUNE_ON_LOAD = "    _announce_pruned(server, _prune_state(server, _state, _config.patterns))\n"
+PRUNE_ON_RELOAD = "    pruned = [] if _state is None else _prune_state(server, _state, _config.patterns)\n"
+PRUNE_CALL = "    removed = _forget_orphans(state, patterns)\n"
+RESET_GUARD = "    if _config_was_reset:\n"
+
+def drop_prune_on_load(src):
+    """重载插件时不再清理已删除规则的统计（回到「要等一次完整开服周期」）。"""
+    return src.replace(PRUNE_ON_LOAD, "    pass  # mutation: no prune on load\n")
+
+def drop_prune_on_reload_command(src):
+    """!!logfilter reload 不再清理已删除规则的统计。"""
+    return src.replace(PRUNE_ON_RELOAD, "    pruned = []  # mutation: no prune on reload\n")
+
+def prune_against_compiled_rules(src):
+    """按「编译成功的规则」而不是「配置原文」判断孤立项 —— 会误删被安全探测拦下的规则。"""
+    return src.replace(
+        PRUNE_CALL,
+        "    removed = _forget_orphans(state, [r.pattern for r in _log_filter.rules])  # mutation\n",
+    )
+
+def ignore_the_reset_guard(src):
+    """配置刚被自动重置（写坏）时也照常清理 —— 会顺手抹掉用户还在的历史。"""
+    return src.replace(RESET_GUARD, "    if False:  # mutation: reset guard ignored\n")
+
 MUTATIONS = [
     ("idle-rule warning disabled", disable_warning,
-     ["tests/test_plugin.py", "-k", "idle or stale or streak"]),
-    ("threshold changed from >= to >", threshold_off_by_one,
+     ["tests/test_plugin.py", "-k", "idle or stale or streak"]),    ("threshold changed from >= to >", threshold_off_by_one,
      ["tests/test_plugin.py", "-k", "threshold or idle_rule"]),
     ("'session finished starting' guard removed", drop_startup_guard,
      ["tests/test_plugin.py", "-k", "never_reached_startup"]),
@@ -176,6 +220,10 @@ MUTATIONS = [
      ["tests/test_plugin.py", "-k", "has_a_description"]),
     ("upgrade announcement silenced", silence_upgrade_announcement,
      ["tests/test_plugin.py", "-k", "announcement or announcement_lists"]),
+    ("the upgrade switch ignored", ignore_the_upgrade_switch,
+     ["tests/test_plugin.py", "-k", "switch"]),
+    ("the broken-config switch ignored", ignore_the_broken_config_switch,
+     ["tests/test_plugin.py", "-k", "switch or leniently"]),
     ("broken config no longer quarantined", drop_quarantine_call,
      ["tests/test_plugin.py", "-k", "broken_config or quarantine or on_load_checks"]),
     ("problem detected but file not backed up", drop_backup_move,
@@ -184,6 +232,14 @@ MUTATIONS = [
      ["tests/test_plugin.py", "-k", "no_annotation or does_not_repeat"]),
     ("config reset not announced", silence_reset_announcement,
      ["tests/test_plugin.py", "-k", "announcement_says_what_where_and_why"]),
+    ("no pruning of deleted rules on plugin load", drop_prune_on_load,
+     ["tests/test_plugin.py", "-k", "prunes_its_state_immediately or announces_what_it_removed"]),
+    ("no pruning of deleted rules on !!logfilter reload", drop_prune_on_reload_command,
+     ["tests/test_plugin.py", "-k", "prunes_its_state_on_the_reload_command"]),
+    ("orphans judged against the compiled rules", prune_against_compiled_rules,
+     ["tests/test_plugin.py", "-k", "rejected_by_the_safety_probe"]),
+    ("history wiped when the config was auto-reset", ignore_the_reset_guard,
+     ["tests/test_plugin.py", "-k", "reset_config_does_not_wipe"]),
 ]
 
 def pytest_ok(workdir, selector):
@@ -215,7 +271,9 @@ def main():
                                      "stale or idle or threshold or reload_does_not_fake or "
                                      "never_reached_startup or catastrophic or migrator or "
                                      "no_comment_fields or has_a_description or "
-                                     "generated_config_contains_only"])
+                                     "generated_config_contains_only or prun or "
+                                     "rejected_by_the_safety_probe or switch or "
+                                     "leniently or raw_bool"])
     print("baseline (unmutated): exit={} {}".format(code, summary))
     if code != 0:
         print("baseline is not green — fix the tests first")
