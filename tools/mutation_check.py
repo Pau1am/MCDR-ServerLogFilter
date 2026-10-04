@@ -40,10 +40,8 @@ ON_START_TAIL = """    if _log_filter is not None:
         _log_filter.reset_counters()
 """
 
-
 def disable_warning(src):
     return src.replace(WARN_BLOCK, "    return  # mutation\n")
-
 
 def threshold_off_by_one(src):
     return src.replace(
@@ -51,20 +49,17 @@ def threshold_off_by_one(src):
         "if entry is not None and entry.zero_streak > threshold:  # mutation",
     )
 
-
 def drop_startup_guard(src):
     return src.replace(
         "if _session_reached_startup and _state is not None:",
         "if _state is not None:  # mutation",
     )
 
-
 def break_carry_over(src):
     return src.replace(
         "        if previous is None:\n            return 0\n",
         "        if previous is None:\n            return 0\n        return 0  # mutation\n",
     )
-
 
 def drop_session_flag_carry_over(src):
     return src.replace(
@@ -73,13 +68,11 @@ def drop_session_flag_carry_over(src):
         "    # mutation: running-session flag not carried over\n",
     )
 
-
 def disable_probe(src):
     return src.replace(
         "        validate=_config.validate_patterns,",
         "        validate=False,  # mutation",
     )
-
 
 def warn_before_startup(src):
     if WARN_BLOCK not in src or ON_START_TAIL not in src:
@@ -99,6 +92,68 @@ def warn_before_startup(src):
 """
     return src.replace(ON_START_TAIL, early, 1)
 
+def inject_a_key_into_the_config(src):
+    """往配置里塞一个非选项键（模拟「自己加注释」的诱惑）。
+
+    配置里除了真正的选项不该有任何键，否则文件会变复杂——这正是注释字段被移除的原因。
+    注入后它会被当成一个真字段，于是生成的 config.json 里会多出一项。
+    """
+    return src.replace(
+        "def _config_option_names() -> List[str]:",
+        'Config.__annotations__["#手写的注释"] = str\n'
+        'setattr(Config, "#手写的注释", "x")\n'
+        "\n"
+        "\n"
+        "def _config_option_names() -> List[str]:",
+        1,
+    )
+
+
+def drop_config_descriptions(src):
+    """让某个配置项不再有说明（升级提示里会变成「未记录说明」）。"""
+    return src.replace(
+        '    "patterns": (\n        "1.0.0",',
+        '    "patterns_UNUSED": (\n        "1.0.0",',
+        1,
+    )
+
+
+QUARANTINE_CALL = "    _quarantine_broken_config(server, CONFIG_FILE_NAME)\n"
+
+DOC_SUFFIX_LINE = '            suffix = "   （已连续 {} 次零命中）".format(entry.zero_streak)\n'
+DOC_SUFFIX_GUARD = "        if entry.zero_streak > threshold:\n"
+
+def drop_quarantine_call(src):
+    """不再检查配置文件 —— 坏文件会被 MCDR 直接覆盖，用户的规则就此消失。"""
+    return src.replace(QUARANTINE_CALL, "    pass  # mutation: no quarantine\n")
+
+def drop_backup_move(src):
+    """检测到了问题，但不真的备份。"""
+    return src.replace(
+        "        os.replace(path, backup)\n",
+        "        pass  # mutation: no backup\n",
+    )
+
+def repeat_streak_for_every_rule(src):
+    """恢复成「每条规则都重复一遍零命中次数」的旧格式。"""
+    return src.replace(
+        DOC_SUFFIX_GUARD,
+        "        if True:  # mutation: always annotate\n",
+    )
+
+def silence_upgrade_announcement(src):
+    """不再报告配置里新增了哪些选项（升级悄悄发生）。"""
+    return src.replace(
+        "    _announce_new_options(server)\n    return config",
+        "    return config  # mutation: upgrade not announced",
+    )
+
+def silence_reset_announcement(src):
+    """不再提示配置已被重置（坏文件被悄悄换掉了）。"""
+    anchor = '    server.logger.error(\n        "\\n".join('
+    if anchor not in src:
+        return src
+    return src.replace(anchor, "    return reason  # mutation: reset not announced\n" + anchor, 1)
 
 MUTATIONS = [
     ("idle-rule warning disabled", disable_warning,
@@ -115,8 +170,21 @@ MUTATIONS = [
      ["tests/test_plugin.py", "-k", "catastrophic or applies_the_probe or validate_patterns"]),
     ("warning moved before the Done line", warn_before_startup,
      ["tests/test_e2e.py", "-k", "arrives_after"]),
+    ("a non-option key injected into the config", inject_a_key_into_the_config,
+     ["tests/test_plugin.py", "-k", "no_comment_fields or generated_config_contains_only"]),
+    ("an option lost its description", drop_config_descriptions,
+     ["tests/test_plugin.py", "-k", "has_a_description"]),
+    ("upgrade announcement silenced", silence_upgrade_announcement,
+     ["tests/test_plugin.py", "-k", "announcement or announcement_lists"]),
+    ("broken config no longer quarantined", drop_quarantine_call,
+     ["tests/test_plugin.py", "-k", "broken_config or quarantine or on_load_checks"]),
+    ("problem detected but file not backed up", drop_backup_move,
+     ["tests/test_plugin.py", "-k", "backed_up_before"]),
+    ("streak repeated for every rule again", repeat_streak_for_every_rule,
+     ["tests/test_plugin.py", "-k", "no_annotation or does_not_repeat"]),
+    ("config reset not announced", silence_reset_announcement,
+     ["tests/test_plugin.py", "-k", "announcement_says_what_where_and_why"]),
 ]
-
 
 def pytest_ok(workdir, selector):
     env = dict(os.environ)
@@ -132,7 +200,6 @@ def pytest_ok(workdir, selector):
                     if "passed" in l or "failed" in l or "error" in l), "(no summary)")
     return proc.returncode, summary
 
-
 def main():
     if not (REPO / ".testlibs").is_dir():
         print("run the tests/README.md setup first (.testlibs is missing)")
@@ -146,7 +213,9 @@ def main():
 
     code, summary = pytest_ok(repo, ["tests/test_plugin.py", "-k",
                                      "stale or idle or threshold or reload_does_not_fake or "
-                                     "never_reached_startup or catastrophic"])
+                                     "never_reached_startup or catastrophic or migrator or "
+                                     "no_comment_fields or has_a_description or "
+                                     "generated_config_contains_only"])
     print("baseline (unmutated): exit={} {}".format(code, summary))
     if code != 0:
         print("baseline is not green — fix the tests first")
@@ -179,7 +248,6 @@ def main():
         return 1
     print("every mutation was caught — the tests have teeth")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

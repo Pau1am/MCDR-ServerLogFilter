@@ -45,6 +45,8 @@ MCDR **>= 2.15.0**。``InfoActionFlag``（``hidden()`` / ``discarded()`` 的区�
 无法在保留事件分发的同时只摘掉控制台回显。低版本上插件会打印一条明确的错误并停用。
 """
 
+import json
+import os
 import re
 import threading
 import time
@@ -69,6 +71,14 @@ MIN_MCDR_VERSION = "2.15.0"
 
 # 存放「每个开服周期的命中数」等历史，与用户手写的 config.json 分开，互不干扰。
 STATE_FILE_NAME = "state.json"
+
+# 用户手写的配置文件。解析失败时先备份成 config.json.old 再让 MCDR 重建。
+CONFIG_FILE_NAME = "config.json"
+CONFIG_BACKUP_SUFFIX = ".old"
+
+# 供提示信息里显示的可读路径（从 MCDR 根目录算起）。
+# 由本文件所在目录名推导，因此不会与插件 id 漂移。
+_CONFIG_FOLDER_DISPLAY = "config/{}".format(os.path.basename(os.path.dirname(os.path.abspath(__file__))))
 
 try:
     from mcdreforged.api.types import InfoActionFlag
@@ -102,6 +112,54 @@ class Config(Serializable):
 
     pattern_probe_timeout_ms: int = 25
     """单条规则单个探测串的耗时上限（毫秒）。正常规则约 1 µs，余量超过一万倍。"""
+
+
+# --------------------------------------------------------------------------
+#  配置项一览（用于升级提示）
+#
+#  这里只描述「每个选项是干什么的、哪个版本加的」，用于在插件更新后告诉管理员
+#  配置里多了什么。配置文件本身不写任何注释——JSON 没有注释语法，而在文件里塞
+#  自定义键会被 MCDR 当成「冗余键」在下一次保存时删掉（实测确认过），
+#  为此专门维护一份说明字段反而把配置弄复杂了。选项的完整说明在 README 里。
+# --------------------------------------------------------------------------
+
+# 配置项 -> (加入的版本, 一句话说明)
+CONFIG_DOC: Dict[str, Tuple[str, str]] = {
+    "patterns": (
+        "1.0.0",
+        "要隐去的日志。正则列表，一行命中任意一条就不在 MCDR 控制台显示"
+        "（服务端自身日志文件不受影响）。",
+    ),
+    "log_matched_lines": (
+        "1.0.0",
+        "true 时把每条被隐去的行也写进 MCDR 日志，用来确认规则真的生效。",
+    ),
+    "report_on_server_stop": (
+        "1.0.0",
+        "true 时在服务端停止时汇总一句「本次共隐去多少行」。",
+    ),
+    "warn_about_stale_rules": (
+        "1.1.0",
+        "true 时，某条规则连续多个开服周期零命中会提醒一次，便于清理失效规则。",
+    ),
+    "stale_rule_threshold": (
+        "1.1.0",
+        "连续多少个开服周期零命中才提醒。设成 0 可关闭该提醒。",
+    ),
+    "validate_patterns": (
+        "1.1.0",
+        "true 时在载入时拦下会拖死主线程的危险正则（如 (a+)+$）并在日志报错。",
+    ),
+    "pattern_probe_timeout_ms": (
+        "1.1.0",
+        "上面那项检查的耗时上限（毫秒）。正常规则约 1 µs，一般无需改动。",
+    ),
+}
+
+
+def _config_option_names() -> List[str]:
+    """按声明顺序列出用户配置项。"""
+    return list(Config.get_field_annotations())
 
 
 class RuleState(Serializable):
@@ -316,6 +374,11 @@ _server: Optional[PluginServerInterface] = None
 _session_reached_startup = False
 
 
+# 本轮读到的配置里缺少哪些选项（= 插件升级后新增的），由 _config_migrator 填写，
+# _announce_new_options 负责报告。
+_newly_added_options: List[str] = []
+
+
 def _log_summary(server: PluginServerInterface, rules: List[Rule]) -> None:
     if rules:
         server.logger.info(
@@ -335,6 +398,127 @@ def _load_state(server: PluginServerInterface) -> State:
 
 def _save_state(server: PluginServerInterface, state: State) -> None:
     server.save_config_simple(state, file_name=STATE_FILE_NAME)
+
+
+def _config_migrator(read_data) -> bool:
+    """``load_config_simple(data_processor=...)`` 钩子：记录哪些选项是本次新添的。
+
+    读到的配置里缺少的选项，正是插件升级后新增的那些；MCDR 会按默认值把它们补上
+    并写回文件（用户已有的取值不受影响），我们只负责把这件事说出来。
+
+    始终返回 False：补写由 MCDR 自己完成，这里不需要它额外再写一次。
+    """
+    global _newly_added_options
+
+    if not isinstance(read_data, dict):
+        return False
+
+    present = set(read_data)
+    _newly_added_options = [
+        name for name in _config_option_names() if name not in present
+    ]
+    return False
+
+
+def _announce_new_options(server: PluginServerInterface) -> None:
+    """插件升级后，把新增了哪些配置项告诉管理员。"""
+    if not _newly_added_options:
+        return
+    lines = [
+        "",
+        "=" * 66,
+        "[ServerLogFilter] 配置已更新：本次新增了 {} 个配置项，已按默认值写入".format(
+            len(_newly_added_options)
+        ),
+    ]
+    for name in _newly_added_options:
+        since, desc = CONFIG_DOC.get(name, ("?", "（未记录说明）"))
+        lines.append("  · {}  （v{} 加入）".format(name, since))
+        lines.append("      {}".format(desc))
+    lines += [
+        "  配置文件：config/server_log_filter/config.json",
+        "  各项含义见 README 的「配置」一节。",
+        "=" * 66,
+        "",
+    ]
+    server.logger.info("\n".join(lines))
+
+
+def _load_config(server: PluginServerInterface) -> Config:
+    """读取配置：自动补齐新增选项与说明字段，并在有新增时给出提示。"""
+    global _newly_added_options
+    _newly_added_options = []
+    _quarantine_broken_config(server, CONFIG_FILE_NAME)
+    config = server.load_config_simple(target_class=Config, data_processor=_config_migrator)
+    _announce_new_options(server)
+    return config
+
+
+def _quarantine_broken_config(
+    server: PluginServerInterface, file_name: str
+) -> Optional[str]:
+    """配置文件解析失败时，先把它挪到 ``<name>.old``。
+
+    返回原始的解析错误说明（一切正常时返回 None），供上层提示用。
+
+    **为什么要在交给 MCDR 之前自己先看一遍：** ``load_config_simple`` 默认
+    ``failure_policy='regen'``，解析失败时它会直接用默认值把原文件**覆盖**掉。
+    用户辛苦写的规则就此消失，而且（在加上这个检查之前）不会有任何提示——
+    最常见的触发方式就是往 ``patterns`` 数组里加规则时漏了一个逗号。
+
+    先把原文件挪走，用户就能照着自己写的那份把内容抄回来。
+    """
+    path = os.path.join(server.get_data_folder(), file_name)
+    if not os.path.isfile(path):
+        return None
+
+    try:
+        with open(path, encoding="utf-8") as handle:
+            raw = handle.read()
+    except OSError:
+        # 读不动（权限之类）就交给 MCDR 自己处理，不在这里抢着报错
+        return None
+
+    try:
+        data = json.loads(raw)
+    except ValueError as error:
+        reason = "JSON 语法错误：{}".format(error)
+    else:
+        if isinstance(data, dict):
+            return None
+        reason = "顶层应为 JSON 对象，实际是 {}".format(type(data).__name__)
+
+    backup = path + CONFIG_BACKUP_SUFFIX
+    try:
+        os.replace(path, backup)
+    except OSError as error:
+        server.logger.error(
+            "[ServerLogFilter] 配置文件无法解析，但备份到 {}.old 也失败了（{}）。"
+            "原文件可能已被重置，请注意保存。".format(file_name, error)
+        )
+        return reason
+
+    server.logger.error(
+        "\n".join(
+            [
+                "",
+                "=" * 66,
+                "[ServerLogFilter] 配置文件无法解析，已重置为默认配置",
+                "  · 出问题的文件：{}/{}".format(_CONFIG_FOLDER_DISPLAY, file_name),
+                "  · 原文件已备份为：{}/{}{}".format(
+                    _CONFIG_FOLDER_DISPLAY, file_name, CONFIG_BACKUP_SUFFIX
+                ),
+                "  · 具体原因：{}".format(reason),
+                "  · 新的 {} 已用默认值生成。请对照备份文件把内容修正后填回，".format(file_name),
+                "    或用 !!logfilter reload 在修好后立即重新加载。",
+                "  常见原因：数组（patterns）里每个元素之间都要有英文逗号 \",\"，",
+                "            且最后一项后面不要留多余的逗号。",
+                "=" * 66,
+                "",
+            ]
+        )
+    )
+    return reason
 
 
 def _update_state_after_session(
@@ -386,6 +570,11 @@ def _emit_stale_warning(
     """在开服完成（Done）之后给出一次醒目提醒。
 
     整段拼成一条消息再发，避免控制台被几十行带时间戳的独立 WARNING 淹没。
+
+    每条规则**只列出它的模式**：连续零命中的次数已经写在标题里了，
+    逐条重复一遍同样的句子只会把有用信息淹掉。只有当某条规则自己的
+    零命中次数比阈值更高（也就是它比标题说的更久没动静）时，
+    才在它后面补一句说明——那条信息是标题里没有的。
     """
     lines = [
         "",
@@ -395,23 +584,16 @@ def _emit_stale_warning(
         ),
     ]
     for pattern, entry in stale:
-        lines.append("  · {}".format(pattern))
-        if entry.total_hits:
-            lines.append(
-                "      已连续 {} 次开服零命中；历史累计命中 {} 次，最后一次在第 {} 次开服".format(
-                    entry.zero_streak, entry.total_hits, entry.last_hit_session
-                )
-            )
-        else:
-            lines.append(
-                "      已连续 {} 次开服零命中；自启用以来从未命中过".format(entry.zero_streak)
-            )
+        suffix = ""
+        if entry.zero_streak > threshold:
+            suffix = "   （已连续 {} 次零命中）".format(entry.zero_streak)
+        lines.append("  · {}{}".format(pattern, suffix))
     lines += [
-        "  通常只有两种可能：",
-        "    1. 这条正则写错了（拼写 / 大小写 / 转义，或与当前服务端版本不匹配）",
-        "    2. 这段日志已经不再产生（例如上游 bug 已被修复）",
+        "  这些规则通常只有两种可能：",
+        "    1. 正则写错了（拼写 / 大小写 / 转义，或与当前服务端版本不匹配）",
+        "    2. 它要过滤的日志已经不再产生（例如上游 bug 已被修复）",
         "  建议：用 !!logfilter test <一行日志> 验证规则是否还匹配；",
-        "        确认无用后从配置的 patterns 里删除该条，",
+        "        确认无用后从配置的 patterns 里删除对应条目，",
         "        若确认只是「本来就罕见」可调大 stale_rule_threshold，",
         "        或用 !!logfilter reset 清空计数重新观察。",
         "  （提醒本身不影响性能，只是为了保持配置干净。）",
@@ -439,7 +621,7 @@ def on_load(server: PluginServerInterface, prev_module) -> None:
         )
         return
 
-    _config = server.load_config_simple(target_class=Config)
+    _config = _load_config(server)
     _state = _load_state(server)
     rules = _build_rules(
         server,
@@ -489,7 +671,7 @@ def on_load(server: PluginServerInterface, prev_module) -> None:
 def _apply_config(server: PluginServerInterface) -> List[Rule]:
     """重读配置并就地替换规则，不重新注册命令与过滤器。"""
     global _config
-    _config = server.load_config_simple(target_class=Config)
+    _config = _load_config(server)
     rules = _build_rules(
         server,
         _config.patterns,

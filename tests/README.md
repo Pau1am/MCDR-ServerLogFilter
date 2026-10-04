@@ -1,8 +1,11 @@
 # 测试 / Tests
 
-本目录是 Server Log Filter 的测试套件。**113 个用例**，覆盖过滤行为、配置、
+本目录是 Server Log Filter 的测试套件。**148 个用例**，覆盖过滤行为、配置、
 命令面、发布打包、**真实 MCDR 端到端**，以及本插件最核心的安全属性
 （被隐去的行仍保留 `process`，事件照常分发）。
+
+> 打包、跨 MCDR 版本矩阵、变异检查等更广的开发话题见
+> [../docs/DEVELOPMENT.md](../docs/DEVELOPMENT.md)。
 
 MCDR 是**硬依赖**：插件配置类继承自 `mcdreforged.api.utils.Serializable`，
 没有 MCDR 连 `import server_log_filter` 都会失败。所以下面的步骤是必需的。
@@ -31,7 +34,7 @@ $env:PYTHONPATH=".testlibs"; python -m pytest tests -v
 预期输出结尾：
 
 ```
-113 passed
+148 passed
 ```
 
 ## 覆盖内容
@@ -45,11 +48,13 @@ $env:PYTHONPATH=".testlibs"; python -m pytest tests -v
 | MCDR 契约 | 2 | `InfoActionFlag.hidden()` 的常量构成；`InfoFilter` 允许改写 `action_flag` |
 | 命令面与元数据 | 8 | `on_load` 注册项；状态/测试/重载命令输出；`reload` 的 ADMIN 权限门禁；插件元数据与 `MIN_MCDR_VERSION` 同步 |
 | 发布打包 | 6 | 见下 |
-| **零命中提醒** | **13** | 阈值语义、命中归零、启动失败不计入、热重载不误判、可关闭、`reset`、历史持久化，见下 |
+| **零命中提醒** | **16** | 阈值语义、命中归零、启动失败不计入、热重载不误判、可关闭、`reset`、历史持久化，**以及「不重复输出」**，见下 |
 | **灾难性回溯防护** | **21** | 8 种真实写法全部放行；4 类危险模式被拦下；开关与超时可配置且**确实接在 `on_load` 上** |
 | **轻量化不变量** | **6** | 热路径的结构性断言（缓存 `hidden()`、无规则短路、命中即停），外加两条宽松的耗时护栏 |
-| **端到端（真实 MCDR）** | **13** | 见下 |
-| **合计** | **113** | |
+| **升级提示与迁移** | **12** | 见下 |
+| **坏配置的保全与重建** | **13** | 见下 |
+| **端到端（真实 MCDR）** | **20** | 见下 |
+| **合计** | **148** | |
 
 > 计数含 `@pytest.mark.parametrize` 展开后的用例数，与 `pytest --collect-only` 一致。
 
@@ -200,7 +205,53 @@ if handler.test_server_startup_done(info):
 `test_on_load_respects_validate_patterns_false` / `test_on_load_honours_the_timeout_setting`
 之后才守得住。
 
-## 变异测试
+## 升级提示与迁移（第 11 组）
+
+两条不变量是这一组的核心：
+
+1. **每个配置项都必须写明加入版本。**
+   `test_every_config_option_has_a_description` 断言 `CONFIG_DOC` 的键集合与 `Config` 的真实字段
+   完全一致，且每条的版本号形如 `X.Y.Z`。于是「新增了配置项却忘了写说明」会直接让测试失败
+   ——那会让升级提示里出现一条没有说明的条目。
+2. **配置里不得出现任何非选项键。**
+   `test_the_generated_config_has_no_comment_fields` 断言生成的配置**恰好**等于选项集合。
+
+> 第 2 条来自一次反复：早期版本为了让配置「自带注释」，往文件里注入过一批 `#<选项名>` 字段。
+> 功能上可行，但让配置文件看起来复杂，最终被移除。
+> 这条用例就是为了防止它（或任何类似的键）再溜回来。
+
+升级提示本身由 `test_upgrade_announcement_lists_options_with_versions` /
+`test_upgrade_announcement_explains_each_new_option` 等用例守住——
+**只报选项名不够，得说清它是干什么的**。
+
+迁移路径本身由**端到端组**覆盖：`_build_instance` 种下的配置只有 1.0.x 的三个选项，
+所以每次跑 e2e 都在真实 MCDR 上走一遍「旧配置 → 自动补齐 → 日志提示」的完整流程。
+
+> 与第 9 组同一个教训：这里也有**接线**用例（`test_on_load_wires_the_migrator_into_config_loading`、
+> `test_reload_command_also_migrates`）。函数本身正确，不等于它真的被挂到了加载路径上。
+
+> 配对实验：`tools/mutation_check.py` 里有一条变异往配置里塞一个非选项键，
+> 用来证明第 2 条不变量真的在起作用。
+
+
+
+## 坏配置的保全与重建（第 12 组）
+
+JSON 很严格，手工加规则时漏一个逗号就会解析失败，而 MCDR 的 `failure_policy='regen'`
+会**直接用默认值覆盖原文件**。所以插件在把文件交给 MCDR 之前先自己检查一遍。
+
+这一组的重点是「保全」而不是「报错」：
+`test_broken_config_is_backed_up_before_being_regenerated` 断言备份文件
+**逐字节等于**用户原来写的内容——报错信息再好，文件没了也是白搭。
+
+被当作「损坏」的几种情况都各有用例：语法错误、空文件、顶层不是 JSON 对象
+（`["a","b"]` / `"str"` / `42` 三种参数化）。另有一条守卫
+`test_quarantine_survives_an_unwritable_location`：连备份都失败时插件必须照常加载，
+而不是在启动阶段抛异常把自己也搭进去。
+
+端到端侧用一条**真实 MCDR** 用例收尾：写入语法错误的 `config.json`，
+断言备份存在且逐字节一致、新配置可正常解析、控制台给出原因与行列号、
+并且**插件仍然正常工作**（回退到默认规则并继续过滤）。
 
 判断一组测试有没有效，唯一可靠的办法是**故意把实现改坏，看测试会不会变红**。
 本套件的关键断言都经过这一步验证，可以直接复跑：
@@ -209,7 +260,7 @@ if handler.test_server_startup_done(info):
 python tools/mutation_check.py
 ```
 
-脚本会依次注入 7 个缺陷，要求相关用例变红；全绿即视为测试失效。已确认能被抓住的变异：
+脚本会依次注入 14 个缺陷，要求相关用例变红；全绿即视为测试失效。已确认能被抓住的变异：
 
 | 变异 | 抓住它的用例 |
 |---|---|
@@ -218,6 +269,15 @@ python tools/mutation_check.py
 | 去掉「必须完成启动」的保护 | `test_a_session_that_never_reached_startup_is_not_counted` |
 | 热重载计数接续失效 | `test_reload_does_not_fake_an_idle_session` |
 | 热重载丢失「本周期已完成启动」标记 | `test_reload_carries_the_running_session_over_to_the_new_module` |
+| 说明字段不再写入配置 | `test_migrator_asks_for_a_save_when_the_config_changes` 等 |
+| 说明字段不再声明为字段 | `test_doc_field_is_a_declared_field` 等 |
+| 把说明字段本身算作「新增选项」 | `test_migrator_reports_the_options_that_were_missing` |
+| 静默升级提示 | `test_upgrade_announcement_lists_options_with_versions` |
+| 某个配置项丢掉说明 | `test_every_config_option_is_documented` |
+| 不再检查配置文件（坏文件被直接覆盖） | `test_on_load_checks_the_config_file` 等 |
+| 检测到问题但不备份 | `test_broken_config_is_backed_up_before_being_regenerated` |
+| 恢复成「每条规则都重复零命中次数」 | `test_a_rule_at_exactly_the_threshold_gets_no_annotation` 等 |
+| 不再提示配置已被重置 | `test_backup_announcement_says_what_where_and_why` |
 | 关闭灾难性回溯探测 | `test_on_load_actually_applies_the_probe` 等 |
 | 提醒时机提前到 `Done` 之前 | `test_stale_rule_warning_arrives_after_the_server_finished_starting` |
 

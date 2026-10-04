@@ -22,29 +22,27 @@ This is an INFO line from the new "ghost block" auto-repair mechanism added in 2
 
 Editing the server's `log4j2.xml` also works, but that is a **global** change: get it wrong and the server may lose important log lines, and it only affects the server side. This plugin takes a different route — **it only touches MCDR**.
 
-## Two key design decisions
+## Is it safe?
 
-### 1. Hide the echo, never discard the info
+**It will not break your server** — that is the property this plugin cares about most.
 
-The plugin uses MCDR's `InfoActionFlag.hidden()`, **not** `discarded()`:
+- **Lines are hidden from the console, not thrown away.**
+  Filtered lines are still delivered to MCDR and to your other plugins, so **even an overly broad
+  rule cannot affect MCDR's own "server startup / stop / player join-leave" detection** — the worst
+  case is simply that you no longer see the line.
+- **The server's own log file is untouched.**
+  `server/logs/latest.log` is written by the server process itself, and **keeps every record**.
 
-| | Console echo | Dispatched to plugin events | MCDR state detection |
-|---|---|---|---|
-| `hidden()` (this plugin) | ❌ hidden | ✅ intact | ✅ works |
-| `discarded()` | ❌ hidden | ❌ lost | ⚠️ may break |
+So: need the full raw log → read `server/logs/latest.log`; want a clean console / web panel →
+use this plugin.
 
-Keeping `process` means the line is **still dispatched to MCDR's info reactors and plugin events**. As a result, **even an overly broad rule cannot break MCDR's own "server startup / stop / player join-leave" detection** — the worst case is simply that you don't see the line on the console. This is the plugin's most important safety property.
-
-### 2. The server's own log file is untouched
-
-`server/logs/latest.log` is written by the server process itself through log4j, entirely independent of this plugin. **Not a single original record is lost.** So:
-
-- Need the full raw log → read `server/logs/latest.log`
-- Want a clean MCDR console / web panel → use this plugin
+> Technically, the plugin uses `InfoActionFlag.hidden()` rather than `discarded()`: the former drops
+> only the console echo and keeps event dispatch, while the latter throws the line away. That is
+> where the "other plugins are unaffected" point above comes from.
 
 ## Installation
 
-1. Download `ServerLogFilter-vX.Y.Z.mcdr` from [Releases](../../releases), or build it yourself (see below)
+1. Download `ServerLogFilter-vX.Y.Z.mcdr` from [Releases](../../releases), or build it yourself (see [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md))
 2. Drop it into the `plugins/` folder of the MCDR instance:
 
 ```
@@ -90,7 +88,56 @@ Running several backends? Put one copy in each — configurations are independen
 > Writing `standing on air` matches the whole line — no `.*` needed.
 > The flip side: a `.` in your pattern matches any character, so use `\.` for a literal dot.
 
-The config file is JSON and **does not support comments**.
+> The config file is JSON, which **has no comment syntax** — each key is explained in the table above.
+
+### Upgrades fill in new options, and say so
+
+After a plugin update, options missing from your config are **filled in from their defaults**
+(MCDR already did this — your existing values are never overwritten). What is new is that the
+plugin now reports it in the log:
+
+```
+==================================================================
+[ServerLogFilter] 配置已更新：本次新增了 4 个配置项，已按默认值写入
+  · warn_about_stale_rules  （v1.1.0 加入）
+      ...
+  配置文件：config/server_log_filter/config.json
+  每一项的用途与加入版本都写在该项正上方的 "#选项名" 字段里。
+==================================================================
+```
+
+One side note: a **mistyped** option name is also treated as redundant and removed. Your config
+therefore never accumulates dead entries — but a typo fails silently rather than erroring, so run
+`!!logfilter` once after editing to confirm the change took effect.
+
+### What happens if you break the config file
+
+JSON is strict, and hand-adding a rule to `patterns` while **dropping a comma** breaks parsing.
+The plugin checks the file itself before handing it to MCDR. When something is wrong it:
+
+1. renames the offending file to `config.json.old` (nothing is lost),
+2. regenerates a default `config.json`, and the plugin keeps working,
+3. tells you plainly what happened:
+
+```
+==================================================================
+[ServerLogFilter] 配置文件无法解析，已重置为默认配置
+  · 出问题的文件：config/server_log_filter/config.json
+  · 原文件已备份为：config/server_log_filter/config.json.old
+  · 具体原因：JSON 语法错误：Expecting ',' delimiter: line 4 column 9 (char 83)
+  ...
+==================================================================
+```
+
+**The line and column point straight at the problem.** Fix it, then run `!!logfilter reload` —
+no restart needed.
+
+> Why the plugin does this itself: on a parse failure MCDR **overwrites the file with defaults**.
+> Without moving the original aside first, your rules would simply be gone.
+> `config.json.old` is a single backup slot — a later failure replaces it.
+
+Also treated as broken: an empty file, or a file whose top level is not a JSON object
+(say, the whole file is an array).
 
 ### Idle-rule reminder
 
@@ -101,12 +148,15 @@ after the server finishes starting (i.e. after the `Done` line):
 
 ```
 ==================================================================
-[ServerLogFilter] 注意：有 1 条过滤规则连续 3 次及以上开服都没有命中
+[ServerLogFilter] 注意：有 2 条过滤规则连续 3 次及以上开服都没有命中
   · standing on air - force-sending blocks below
-      已连续 3 次开服零命中；自启用以来从未命中过
+  · test12345
   ...
 ==================================================================
 ```
+
+The count lives in the header only; each rule is listed once. A rule idle **longer than the
+threshold** gets a short `（已连续 9 次零命中）` note — that part is not in the header.
 
 Worth knowing:
 
@@ -165,168 +215,48 @@ Verify with `!!logfilter test <text>` first, then `!!logfilter reload`.
 
 A malformed regex will not crash the plugin — the rule is skipped with a warning in the MCDR log and the remaining rules keep working.
 
-## Verification
+## What it looks like once installed
 
-### Unit tests (filtering logic, edge cases, safety properties)
+The console stops flooding, and the server's own log keeps every line:
 
-- The target spam line is hidden while `process` is preserved (the key safety property)
-- **15 classes of must-not-touch lines verified individually**: `Done (...)!`, player join/leave,
-  `Stopping the server` / `Stopping server`, `moved too quickly`, `moved wrongly`,
-  `Rejecting UseItemOnPacket`, `dropping items too fast`, chat signature warnings,
-  `lost connection`, the version banner, `Preparing level`, death messages,
-  `Saving and pausing game...`
-- No crash on `""` / `None` / whitespace-only `content`
-- Matches regardless of player name
-- Multiple rules keep independent counts; `reload` resets counters
-- An invalid regex is skipped with a warning and does not affect other rules
-- Nearly-identical-but-different lines are **not** matched (proving it is not a blanket filter)
-- **Idle-rule reminder**: fires only at the threshold, a single hit resets the streak, sessions that
-  never finished starting are ignored, a plugin reload cannot fake an idle rule, it can be switched
-  off, and `reset` clears the counters
-- **Regex safety check**: four classes of catastrophic-backtracking pattern are refused, while eight
-  realistic rule shapes all pass
+```
+[ServerLogFilter] Enabled 1 log filter rule; matches are hidden from the MCDR console only, the server log is unaffected
+[ServerLogFilter] Hidden 3 server log lines from the MCDR console this run (server log file unaffected)
+```
 
-### End-to-end (real MCDR + a fake server, full lifecycle)
+Those same lines are **still complete** in `server/logs/latest.log`.
 
-Observed console echo (default rule):
+## Troubleshooting
 
-| Log line | Result |
+| Symptom | What to do |
 |---|---|
-| `Player <any name> standing on air - force-sending blocks below` | ✅ hidden (0 occurrences) |
-| `Steve moved too quickly!` / `moved wrongly!` | ✅ kept |
-| `Steve joined the game` | ✅ kept |
-| Any ordinary log line | ✅ kept |
-| `Stopping server` | ✅ kept |
+| A rule does not seem to work | `!!logfilter test <a log line>` to see whether it would be hidden; then `!!logfilter reload` |
+| A rule is reported as idle | Its regex is probably wrong, or that log line no longer occurs — follow the advice in the reminder |
+| The config file was reset | Look for `config.json.old`: that is your original file. The message names the cause and the line number |
+| Temporarily disable filtering | Empty `patterns`, then `!!logfilter reload` |
 
-Plugin log:
-
-```
-Plugin server_log_filter@1.1.0 loaded
-Enabled 1 log filter rule; matches are hidden from the MCDR console only, the server log is unaffected
-Hidden 3 server log lines from the MCDR console this run (server log file unaffected)
-```
-
-**No errors at all.**
-
-There is also a **canary-backed end-to-end case** guarding the "hidden but still dispatched" safety
-property: it makes the filter *also* match the server-startup line, then asserts both that the line
-left the console **and** that MCDR's `SERVER_STARTUP` event was still dispatched. That is what makes
-`hidden()` and `discarded()` observably different — with the default rule alone, both look identical,
-because noise lines never take part in lifecycle detection. See [tests/README.md](tests/README.md).
-
-### Running the tests
-
-The behaviour above is covered by an automated suite (`tests/`, 113 cases) that runs against a real
-MCDR — **including the end-to-end group below**, which boots an actual MCDR instance, loads the
-`.mcdr` produced by `pack.py`, and drives a fake server through a full lifecycle:
-
-```bash
-python -m pip install --target .testlibs -r tests/requirements-test.txt
-PYTHONPATH=.testlibs python -m pytest tests -v      # Windows: $env:PYTHONPATH=".testlibs"
-```
-
-The suite asserts the plugin's key safety property: a hidden line **keeps `process` and only
-loses `echo_to_console`** — that it **really is absent from the console**, and that **events are
-still dispatched**. If a future MCDR release changes the semantics of `hidden()`, the tests fail
-loudly instead of letting the plugin misbehave silently on your server.
-The end-to-end group takes ~5–6 s (one MCDR boot shared by all cases); skip it with
-`MCDR_SKIP_E2E=1`.
-See [tests/README.md](tests/README.md) for details.
-
-## Building from source
-
-The repository follows MCDR's standard layout — root metadata plus a same-named code package:
-
-```
-MCDR-ServerLogFilter/
-├── mcdreforged.plugin.json
-├── LICENSE
-├── README.md            ← not shipped
-├── README_en.md         ← not shipped
-├── CHANGELOG.md
-├── pack.py
-└── server_log_filter/
-    └── __init__.py
-```
-
-Build with the included, allowlist-based packer:
-
-```bash
-python pack.py            # -> ServerLogFilter-v<version>.mcdr
-```
-
-The release artifact contains exactly **4 files** (about 14 KiB):
-
-| File | Purpose |
-|---|---|
-| `mcdreforged.plugin.json` | plugin metadata (required) |
-| `server_log_filter/__init__.py` | the plugin code |
-| `CHANGELOG.md` | shipped changelog |
-| `LICENSE` | MIT licence |
-
-Neither README is packaged: MCDR never reads them, they duplicate the release page, and
-dropping them halves the artifact (28 KB -> 14 KB).
-
-> **Why an allowlist and not a skip list?** An earlier version of this section used
-> `rglob("*")` with a short `skip` set, which is a *denylist*: any new file in the repo
-> silently ends up in the release artifact. Two concrete consequences:
->
-> 1. **The artifact would fail to load at all.** MCDR validates the root entries of a
->    `.mcdr` (`PackedPlugin._check_dir_legality`) and raises
->    `IllegalPluginStructure: Packed plugin cannot contain other module` for a root-level
->    `conftest.py` or `setup.py`. The test suite's `conftest.py` sits exactly there, so the
->    denylist approach ships a plugin that cannot be loaded.
-> 2. **Runaway size.** After installing `.testlibs/` per `tests/README.md`, the denylist
->    bundled all of MCDR and its dependencies: measured at **1362 files / 7.11 MB**.
->
-> `test_packaged_artifact_is_loadable` in `tests/test_plugin.py` runs `pack.py` and checks
-> the result with MCDR's own validation, and `test_packager_ships_exactly_the_allowlist`
-> pins the artifact's contents so the list cannot drift again.
-
-## Requirements
-
-- MCDReforged **>= 2.15.0**
-
-  > Why not 2.13? The plugin's core design relies on `InfoActionFlag.hidden()`
-  > (strip the console echo only, keep event dispatch), and that class was introduced in
-  > **MCDR 2.15.0**. In 2.14.x and earlier, `InfoFilter` only supports
-  > "return `False` to discard the whole line", which cannot reproduce this plugin's
-  > behaviour, so those versions are not supported.
-  > Installing on an older MCDR never fails silently — MCDR reports
-  > `dependency mcdreforged@x.y.z does not satisfy version requirement >=2.15.0`.
-
-- Python >= 3.9 (bundled with MCDR)
-
-## Compatibility
+## Requirements & compatibility
 
 | Dimension | Support |
 |---|---|
-| MCDR | **>= 2.15.0** |
+| MCDReforged | **>= 2.15.0** (2.15.0 / 2.15.7 / 2.16.0 tested) |
+| Python | >= 3.9 (bundled with MCDR; usually nothing to do) |
 | Minecraft | **Independent of the MC version.** 1.16.5 / 1.19.4 / 1.20.1 / 1.20.6 / 1.21.8 / 1.21.11 / 26.1 / 26.2 / 26.3 all tested against real servers |
 
-Filtering happens on the MCDR side (matching each line of the server's stdout), so it does
-not change with the MC version. The only version-dependent part is **what the default rule
-targets**: `standing on air - force-sending blocks below` is only produced by **MC 26.3**.
-On earlier versions the plugin still works — the default rule simply never matches anything,
-and you can configure `patterns` to filter whatever noise your version emits.
+Installing on an older MCDR fails loudly rather than silently — MCDR reports the unmet version
+requirement and refuses to load the plugin.
 
-### MCDR versions, measured
+Filtering happens on the MCDR side (matching each line the server prints), so it does not change
+with the MC version. The only version-dependent part is **what the default rule targets**:
+`standing on air - force-sending blocks below` is produced only by **MC 26.3**. On earlier
+versions the plugin still works — the default rule simply never matches, and you can put whatever
+noise your version emits into `patterns`.
 
-| MCDR | Result |
-|---|---|
-| 2.13.0 / 2.14.1 | Blocked by MCDR's own dependency check: `dependency mcdreforged@x.y.z does not satisfy version requirement >=2.15.0` |
-| **2.15.0** (minimum) | Loading, filtering, idle-rule reminder, state file, and commands (including `!!logfilter reset`) all verified |
-| 2.15.7 | Same — all verified |
-| 2.16.0 | Same — all verified |
+## Developers
 
-The reason the floor is 2.15.0 is explained under [Requirements](#requirements).
-Every feature — including the idle-rule reminder and the regex safety check added in
-v1.1.0 — behaves **identically** on these three versions (same warning timing, same
-idle-streak bookkeeping, same state file, same command tree, no exceptions).
-
-> The APIs the v1.1.0 features rely on (`save_config_simple`, `load_config_simple` with
-> `file_name`, nested `Serializable`, `on_server_startup`) have all existed since
-> **MCDR 2.13.0**, so **the minimum version requirement is unchanged at 2.15.0**.
+Building, testing and the version compatibility matrix live in
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md); the test suite is documented in
+[tests/README.md](tests/README.md).
 
 ## License
 

@@ -86,7 +86,7 @@ class FakeSource:
 
 
 class FakePluginServer:
-    def __init__(self, logger=None, config_data=None, state_data=None):
+    def __init__(self, logger=None, config_data=None, state_data=None, data_folder=None):
         self.logger = logger or RecordingLogger()
         self.info_filters = []
         self.help_messages = []
@@ -95,6 +95,14 @@ class FakePluginServer:
         self.config_data = config_data
         self.state_data = state_data
         self.saved = {}
+        self.load_kwargs = {}
+        self.data_folder = data_folder
+
+    def get_data_folder(self):
+        """A throwaway folder by default, so no real config file is ever touched."""
+        if self.data_folder is None:
+            self.data_folder = tempfile.mkdtemp(prefix="slf_cfg_")
+        return self.data_folder
 
     def register_info_filter(self, f):
         self.info_filters.append(f)
@@ -108,7 +116,20 @@ class FakePluginServer:
     def load_config_simple(self, file_name=None, target_class=None, **kwargs):
         if file_name == slf.STATE_FILE_NAME:
             return target_class.deserialize(self.state_data or {})
-        self.config = target_class.deserialize(self.config_data or {})
+
+        self.load_kwargs = kwargs
+        # Mirror MCDR: the data_processor runs against the raw dict read from the
+        # file, its return value decides whether the file gets written back, and
+        # the (possibly mutated) dict is what gets deserialized.
+        data = dict(self.config_data) if self.config_data is not None else None
+        processor = kwargs.get("data_processor")
+        needs_save = False
+        if processor is not None and data is not None:
+            needs_save = bool(processor(data))
+
+        self.config = target_class.deserialize(data if data is not None else {})
+        if needs_save:
+            self.saved["config.json"] = self.config.serialize()
         return self.config
 
     def save_config_simple(self, config, file_name=None, **kwargs):
@@ -703,11 +724,61 @@ def test_idle_rule_is_reported_once_the_streak_reaches_the_threshold():
     slf.on_server_startup(server)
     text = warnings_of(server)
     assert IDLE in text
-    assert "连续 2 次及以上开服都没有命中" in text
-    assert "已连续 2 次开服零命中" in text
-    assert "从未命中过" in text
+    assert "有 1 条过滤规则连续 2 次及以上开服都没有命中" in text
     # the rule that is working is not mentioned
     assert LIVE not in text
+
+
+def test_stale_warning_does_not_repeat_the_streak_for_every_rule():
+    """Two idle rules must not produce two identical "已连续 N 次…" lines.
+
+    The count is already stated in the header; repeating it per rule pushes the
+    useful part (which rules, and what to do) off the screen.
+    """
+    server = start_plugin(
+        config={"patterns": [IDLE, "another-idle-rule", LIVE], "stale_rule_threshold": 1}
+    )
+    run_session(server, hits={LIVE: 3})
+    slf.on_server_start(server)
+    slf.on_server_startup(server)
+
+    text = warnings_of(server)
+    assert "有 2 条过滤规则连续 1 次及以上开服都没有命中" in text
+    # both patterns are listed
+    assert "· " + IDLE in text
+    assert "· another-idle-rule" in text
+    # ...but the per-rule streak sentence appears exactly zero times
+    assert "从未命中过" not in text
+    assert "开服零命中；" not in text
+    assert text.count("都没有命中") == 1, "the header must be stated once"
+
+
+def test_a_rule_idle_longer_than_the_threshold_still_says_so():
+    """Information the header cannot carry is still worth showing.
+
+    The header only promises "threshold or more"; a rule idle far longer than that
+    is a stronger signal (probably obsolete rather than mistyped).
+    """
+    server = start_plugin(config={"patterns": [IDLE], "stale_rule_threshold": 1})
+    for _ in range(4):
+        run_session(server)                      # never matches -> streak climbs
+    slf.on_server_start(server)
+    slf.on_server_startup(server)
+
+    text = warnings_of(server)
+    assert "连续 1 次及以上" in text
+    assert "（已连续 4 次零命中）" in text, "a longer streak must not be hidden"
+
+
+def test_a_rule_at_exactly_the_threshold_gets_no_annotation():
+    server = start_plugin(config={"patterns": [IDLE], "stale_rule_threshold": 3})
+    for _ in range(3):
+        run_session(server)
+    slf.on_server_start(server)
+    slf.on_server_startup(server)
+
+    text = warnings_of(server)
+    assert "（已连续" not in text, "nothing to add beyond the header, so add nothing"
 
 
 def test_a_matching_rule_never_becomes_stale():
@@ -1098,3 +1169,285 @@ def test_state_tracking_adds_no_work_to_the_per_line_path():
         )
     assert touched == [], "per-line filtering must not write the state file"
     assert slf._log_filter.total == 50
+
+
+# ---------------------------------------------------------------------------
+#  11. upgrade notification
+# ---------------------------------------------------------------------------
+
+def config_options():
+    """The real, user-facing configuration options."""
+    return set(slf.Config.get_field_annotations())
+
+
+def test_every_config_option_has_a_description():
+    """Coverage invariant for the notes shown when a config gains new options.
+
+    Adding an option without recording its version would make the upgrade notice
+    announce a blank entry, so this fails until the option is described.
+    """
+    documented = set(slf.CONFIG_DOC)
+    assert config_options() == documented, (
+        "undocumented options: {}; stale entries: {}".format(
+            config_options() - documented, documented - config_options()
+        )
+    )
+    for name, (since, desc) in slf.CONFIG_DOC.items():
+        assert re.match(r"^\d+\.\d+\.\d+$", since), "{}: bad version {!r}".format(name, since)
+        assert desc.strip(), "{}: empty description".format(name)
+
+
+def test_the_generated_config_has_no_comment_fields():
+    """The config must stay plain — no bookkeeping keys mixed in with user settings.
+
+    An earlier revision injected ``#option`` fields to imitate comments; it made the
+    file look complicated, so it was removed. Nothing but real options may ship.
+    """
+    data = slf.Config().serialize()
+    assert set(data) == config_options()
+    assert not [k for k in data if k.startswith("#")]
+
+
+def test_migrator_reports_the_options_that_were_missing():
+    slf._newly_added_options = []
+    raw = {"patterns": ["x"]}                      # a 1.0.x era config
+    slf._config_migrator(raw)
+    assert slf._newly_added_options == [
+        "log_matched_lines", "report_on_server_stop", "warn_about_stale_rules",
+        "stale_rule_threshold", "validate_patterns", "pattern_probe_timeout_ms",
+    ]
+
+
+def test_migrator_says_nothing_when_the_config_is_complete():
+    slf._newly_added_options = ["stale"]
+    assert slf._config_migrator(slf.Config().serialize()) is False
+    assert slf._newly_added_options == []
+
+
+def test_migrator_never_asks_for_a_write():
+    """Filling in the missing options is MCDR's job; the hook only observes."""
+    slf._newly_added_options = []
+    assert slf._config_migrator({"patterns": ["x"]}) is False
+
+
+def test_migrator_tolerates_a_non_dict_config():
+    """A malformed file must not crash the loader before MCDR can regenerate it."""
+    assert slf._config_migrator(["not", "a", "dict"]) is False
+
+
+def test_on_load_wires_the_migrator_into_config_loading():
+    """Guard the wiring, not just the function — a correct function that is not
+    connected does nothing."""
+    server = FakePluginServer(config_data={"patterns": [LIVE]})
+    slf.on_load(server, None)
+    assert server.load_kwargs.get("data_processor") is slf._config_migrator
+
+
+def test_reload_command_also_migrates():
+    server = start_plugin(config={"patterns": [LIVE]})
+    server.load_kwargs = {}
+    server.config_data = {"patterns": [LIVE]}       # a stale, partial config appears
+    slf._apply_config(server)
+    assert server.load_kwargs.get("data_processor") is slf._config_migrator
+
+
+def announce_output(server):
+    return "\n".join(server.logger.infos)
+
+
+def test_upgrade_announcement_lists_options_with_versions():
+    server = FakePluginServer(config_data={"patterns": [LIVE]})
+    slf.on_load(server, None)
+    text = announce_output(server)
+    assert "配置已更新" in text
+    for name in ("warn_about_stale_rules", "stale_rule_threshold",
+                 "validate_patterns", "pattern_probe_timeout_ms"):
+        assert name in text
+    assert "v1.1.0 加入" in text
+
+
+def test_upgrade_announcement_explains_each_new_option():
+    """Naming the option is not enough — say what it does."""
+    server = FakePluginServer(config_data={"patterns": [LIVE]})
+    slf.on_load(server, None)
+    text = announce_output(server)
+    for name, (_, desc) in slf.CONFIG_DOC.items():
+        if name in ("patterns", "log_matched_lines", "report_on_server_stop"):
+            continue
+        assert desc.split("。")[0] in text, "{}: description missing".format(name)
+
+
+def test_no_announcement_when_the_config_is_already_current():
+    server = start_plugin(config=slf.Config().serialize())
+    server.logger.infos.clear()
+    slf.on_load(server, None)
+    assert "配置已更新" not in announce_output(server)
+
+
+def test_announcement_is_logged_exactly_once():
+    server = FakePluginServer(config_data={"patterns": [LIVE]})
+    slf.on_load(server, None)
+    assert announce_output(server).count("配置已更新") == 1
+
+
+# ---------------------------------------------------------------------------
+#  12. a broken config file is preserved, not silently overwritten
+# ---------------------------------------------------------------------------
+
+# What a user typically produces by hand-adding a rule and forgetting the comma.
+BROKEN_JSON = '''{
+    "patterns": [
+        "standing on air - force-sending blocks below"
+        "my-own-rule"
+    ],
+    "report_on_server_stop": true
+}
+'''
+
+
+def server_with_config_file(tmp_path, text):
+    """A fake server whose data folder holds ``text`` as config.json."""
+    folder = tmp_path / "cfg"
+    folder.mkdir()
+    (folder / "config.json").write_text(text, encoding="utf-8")
+    return FakePluginServer(data_folder=str(folder)), folder
+
+
+def test_parse_error_truncated():
+    """"line"/"column" must survive into the reported reason: that is the part
+    that tells a user where to look."""
+    import json
+
+    try:
+        json.loads(BROKEN_JSON)
+    except ValueError as error:
+        reason = "JSON 语法错误：{}".format(error)
+    else:
+        raise AssertionError("the fixture is supposed to be invalid JSON")
+    assert "line" in reason and "column" in reason, reason
+
+
+def test_broken_config_is_backed_up_before_being_regenerated(tmp_path):
+    server, folder = server_with_config_file(tmp_path, BROKEN_JSON)
+
+    slf._quarantine_broken_config(server, slf.CONFIG_FILE_NAME)
+
+    backup = folder / "config.json.old"
+    assert backup.is_file(), "the user's file must be preserved"
+    assert backup.read_text(encoding="utf-8") == BROKEN_JSON, "byte for byte"
+    assert not (folder / "config.json").exists(), "the original is moved aside"
+
+
+def test_backup_announcement_says_what_where_and_why(tmp_path):
+    server, folder = server_with_config_file(tmp_path, BROKEN_JSON)
+
+    slf._quarantine_broken_config(server, slf.CONFIG_FILE_NAME)
+
+    assert len(server.logger.errors) == 1
+    text = server.logger.errors[0]
+    assert "配置文件无法解析" in text
+    assert "已重置为默认配置" in text
+    assert "config.json.old" in text, "the user must be told where the backup is"
+    assert "JSON 语法错误" in text, "and why it failed"
+    assert "line" in text and "column" in text, "and where in the file"
+    assert "逗号" in text, "plus the likely cause for this very common mistake"
+
+
+def test_a_valid_config_is_left_alone(tmp_path):
+    server, folder = server_with_config_file(
+        tmp_path, json.dumps({"patterns": ["x"]}, indent=4)
+    )
+
+    assert slf._quarantine_broken_config(server, slf.CONFIG_FILE_NAME) is None
+    assert not (folder / "config.json.old").exists()
+    assert server.logger.errors == []
+
+
+def test_a_missing_config_is_not_an_error(tmp_path):
+    """First run: there is nothing to back up and nothing to complain about."""
+    folder = tmp_path / "empty"
+    folder.mkdir()
+    server = FakePluginServer(data_folder=str(folder))
+
+    assert slf._quarantine_broken_config(server, slf.CONFIG_FILE_NAME) is None
+    assert server.logger.errors == []
+    assert not (folder / "config.json.old").exists()
+
+
+def test_an_empty_config_file_is_treated_as_broken(tmp_path):
+    """A truncated file is a real way to lose a config."""
+    server, folder = server_with_config_file(tmp_path, "")
+
+    assert slf._quarantine_broken_config(server, slf.CONFIG_FILE_NAME) is not None
+    assert (folder / "config.json.old").is_file()
+
+
+@pytest.mark.parametrize("text", ['["a", "b"]', '"just a string"', "42"])
+def test_json_that_is_not_an_object_is_also_quarantined(tmp_path, text):
+    """MCDR would reject these too, so they must not be silently replaced."""
+    server, folder = server_with_config_file(tmp_path, text)
+
+    reason = slf._quarantine_broken_config(server, slf.CONFIG_FILE_NAME)
+
+    assert reason is not None and "顶层应为 JSON 对象" in reason
+    assert (folder / "config.json.old").read_text(encoding="utf-8") == text
+
+
+def test_a_second_failure_overwrites_the_previous_backup(tmp_path):
+    """One ``.old`` slot: the most recent broken file is the one worth reading."""
+    server, folder = server_with_config_file(tmp_path, BROKEN_JSON)
+    slf._quarantine_broken_config(server, slf.CONFIG_FILE_NAME)
+
+    (folder / "config.json").write_text("{ even more broken", encoding="utf-8")
+    slf._quarantine_broken_config(server, slf.CONFIG_FILE_NAME)
+
+    assert (folder / "config.json.old").read_text(encoding="utf-8") == "{ even more broken"
+
+
+def test_on_load_checks_the_config_file():
+    """Wiring guard: the check has to run on the real load path."""
+    checked = []
+    server = FakePluginServer(config_data={"patterns": [LIVE]})
+    original = slf._quarantine_broken_config
+
+    def spy(srv, name):
+        checked.append(name)
+        return original(srv, name)
+
+    slf._quarantine_broken_config = spy
+    try:
+        slf.on_load(server, None)
+    finally:
+        slf._quarantine_broken_config = original
+    assert checked == [slf.CONFIG_FILE_NAME]
+
+
+def test_reload_command_checks_the_config_file_too():
+    server = start_plugin(config={"patterns": [LIVE]})
+    checked = []
+    original = slf._quarantine_broken_config
+
+    def spy(srv, name):
+        checked.append(name)
+        return original(srv, name)
+
+    slf._quarantine_broken_config = spy
+    try:
+        slf._apply_config(server)
+    finally:
+        slf._quarantine_broken_config = original
+    assert checked == [slf.CONFIG_FILE_NAME]
+
+
+def test_quarantine_survives_an_unwritable_location(tmp_path, monkeypatch):
+    """If even the backup fails, the plugin must still load rather than crash."""
+    server, folder = server_with_config_file(tmp_path, BROKEN_JSON)
+
+    def boom(src, dst):
+        raise OSError("simulated")
+
+    monkeypatch.setattr(slf.os, "replace", boom)
+    reason = slf._quarantine_broken_config(server, slf.CONFIG_FILE_NAME)
+
+    assert reason is not None, "the problem is still reported"
+    assert any("备份" in m for m in server.logger.errors)
