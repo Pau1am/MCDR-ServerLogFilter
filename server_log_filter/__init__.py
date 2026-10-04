@@ -17,7 +17,26 @@ MC-311474 / MC-311727，每人每 10 秒最多一条）。本插件按用户提�
 2. 服务端自己的日志文件（``server/logs/latest.log``）由服务端进程用 log4j 自己写入，
    与本插件无关，**完全不受影响**，原始记录一条不少。
 3. ``filter_server_info`` 运行在 MCDR 的主线程上（不是任务执行器线程），必须足够快。
-   因此正则在载入时预编译，匹配时按顺序短路返回；只有命中时才加锁计数。
+   因此正则在载入时预编译，匹配时按顺序短路返回；只有命中时才加锁计数；
+   ``hidden()`` 这个不变常量也在构造时算好，避免每次命中都重新构造。
+
+关于「零命中提醒」
+------------------
+配置里的某条规则如果连续若干个开服周期一次都没命中，它大概率是**写错了**，
+或者它要过滤的那段日志**已经不再产生**（例如上游 bug 被修复）。插件会在下一个开服周期
+完成启动（控制台出现 ``Done``）之后给出一次醒目提醒，方便管理员清理配置。
+
+需要说明的是：**这个提醒本身并不降低运行开销。** 实测本插件的过滤开销约为
+每行 0.2 µs（1 条规则），不到 MCDR 自身解析同一行所需时间的十分之一；
+即便在 1000 行/秒的极端突发下，每小时累计也只占 0.7 秒。
+删掉一条用不到的规则所能省下的时间远低于测量噪声——这个提醒的价值在于**配置卫生**：
+尽早发现写错的规则，以及发现「已经没必要再过滤了」的规则。
+（上述数字可用 ``benchmarks/bench_filter.py`` 复现。）
+
+真正会影响性能的是**写坏的正则**：带嵌套量词的表达式（如 ``(a+)+$``）会产生
+灾难性回溯，实测单行就能耗掉数百毫秒乃至数秒，足以冻结 MCDR 主线程。
+因此 ``validate_patterns`` 默认开启：载入时用短探测串检查每条规则，
+把这类规则拦下并给出明确提示，而不是等它在生产环境里拖垮服务端。
 
 运行要求
 --------
@@ -28,7 +47,8 @@ MCDR **>= 2.15.0**。``InfoActionFlag``（``hidden()`` / ``discarded()`` 的区�
 
 import re
 import threading
-from typing import List, Optional, Pattern
+import time
+from typing import Dict, List, Optional, Pattern, Tuple
 
 from mcdreforged.api.command import GreedyText, Literal
 from mcdreforged.api.rtext import RColor, RText, RTextList
@@ -47,10 +67,18 @@ DEFAULT_PATTERN = r"standing on air - force-sending blocks below"
 # 这里做容错导入，让低版本 MCDR 得到一句人能看懂的提示，而不是裸 ImportError。
 MIN_MCDR_VERSION = "2.15.0"
 
+# 存放「每个开服周期的命中数」等历史，与用户手写的 config.json 分开，互不干扰。
+STATE_FILE_NAME = "state.json"
+
 try:
     from mcdreforged.api.types import InfoActionFlag
 except ImportError:  # pragma: no cover - 仅在 MCDR < 2.15.0 上触发
     InfoActionFlag = None  # type: ignore[assignment]
+
+
+# --------------------------------------------------------------------------
+#  配置与状态
+# --------------------------------------------------------------------------
 
 
 class Config(Serializable):
@@ -63,15 +91,49 @@ class Config(Serializable):
     report_on_server_stop: bool = True
     """服务端停止时，在 MCDR 日志里汇总本次运行共隐去了多少行。"""
 
+    warn_about_stale_rules: bool = True
+    """某条规则连续多个开服周期零命中时，在下次启动完成后给出提醒。"""
+
+    stale_rule_threshold: int = 3
+    """连续多少个开服周期零命中才提醒。调大可以容忍「本来就罕见」的规则。"""
+
+    validate_patterns: bool = True
+    """载入时用短探测串检查灾难性回溯，把这类规则拦下。强烈建议保持开启。"""
+
+    pattern_probe_timeout_ms: int = 25
+    """单条规则单个探测串的耗时上限（毫秒）。正常规则约 1 µs，余量超过一万倍。"""
+
+
+class RuleState(Serializable):
+    """某条规则的跨周期历史。按 pattern 字符串记录，与配置顺序无关。"""
+
+    hits_last_session: int = 0
+    zero_streak: int = 0
+    total_hits: int = 0
+    last_hit_session: int = 0
+
+
+class State(Serializable):
+    """持久化在 ``config/server_log_filter/state.json``，与用户手写的配置分开。"""
+
+    session_index: int = 0
+    rules: Dict[str, RuleState] = {}
+
+
+# --------------------------------------------------------------------------
+#  规则与过滤器
+# --------------------------------------------------------------------------
+
 
 class Rule:
     """一条已编译的过滤规则，附带命中计数。"""
 
     __slots__ = ("pattern", "regex", "count")
 
-    def __init__(self, pattern: str):
+    def __init__(self, pattern: str, regex: Optional[Pattern] = None):
         self.pattern = pattern
-        self.regex: Pattern = re.compile(pattern)
+        # 允许传入已编译的正则，避免「先编译校验、再编译一次」的重复开销
+        self.regex: Pattern = regex if regex is not None else re.compile(pattern)
         self.count = 0
 
 
@@ -79,16 +141,20 @@ class ServerLogFilter(InfoFilter):
     """按规则把匹配的服务端输出从控制台隐去。"""
 
     def __init__(self, rules: List[Rule], logger, log_matched_lines: bool):
-        self._rules = rules
+        # 用 tuple：迭代略快，且避免外部误改；替换时整体赋值，天然是原子操作。
+        self._rules: Tuple[Rule, ...] = tuple(rules)
         self._logger = logger
         self._log_matched_lines = log_matched_lines
-        # filter_server_info 在 MCDR 主线程被调用，而 !!logfilter 命令在任务执行器
-        # 线程读取计数，所以计数需要加锁保护。
+        # filter_server_info 在 MCDR 主线程被调用，而 !!logfilter 命令与
+        # on_server_stop 在别的线程读取计数，所以计数需要加锁保护。
         self._lock = threading.Lock()
         self._total = 0
+        # hidden() 每次调用都会新建一个 Flag 对象，而它其实是个不变常量。
+        # 这里算一次、每次命中直接复用，省掉命中路径上的最后一次函数调用。
+        self._hidden_flag = InfoActionFlag.hidden() if InfoActionFlag is not None else None
 
     @property
-    def rules(self) -> List[Rule]:
+    def rules(self) -> Tuple[Rule, ...]:
         return self._rules
 
     @property
@@ -96,14 +162,33 @@ class ServerLogFilter(InfoFilter):
         with self._lock:
             return self._total
 
+    def carry_over_from(self, previous: Optional["ServerLogFilter"]) -> int:
+        """插件热重载时，把上一份实例的命中数接过来。
+
+        不接过来的话，一次开服周期会被重载切成两段，重载后的计数从 0 重新开始，
+        停止时就会把一个正常命中的周期误判成「零命中」，进而触发假的零命中提醒。
+        """
+        if previous is None:
+            return 0
+        previous_counts = {rule.pattern: rule.count for rule in previous.rules if rule.count}
+        carried = 0
+        with self._lock:
+            for rule in self._rules:
+                hits = previous_counts.get(rule.pattern, 0)
+                if hits:
+                    rule.count = hits
+                    carried += hits
+            self._total = carried
+        return carried
+
     def reload_rules(self, rules: List[Rule], log_matched_lines: bool) -> None:
         """就地替换规则（用于命令重载，无需重新注册 InfoFilter）。
 
-        替换的是列表引用，Python 中该操作是原子的；正在迭代旧列表的调用会安全地
-        跑完旧列表，不会看到半新半旧的状态。
+        替换的是 tuple 引用，Python 中该操作是原子的；正在迭代旧 tuple 的调用会安全地
+        跑完旧 tuple，不会看到半新半旧的状态。
         """
         with self._lock:
-            self._rules = rules
+            self._rules = tuple(rules)
             self._log_matched_lines = log_matched_lines
             self._total = 0
 
@@ -121,6 +206,10 @@ class ServerLogFilter(InfoFilter):
         return None
 
     def filter_server_info(self, info) -> None:
+        rules = self._rules
+        if not rules:
+            return
+
         content = info.content
         if content is None:
             content = getattr(info, "raw_content", None)
@@ -134,7 +223,7 @@ class ServerLogFilter(InfoFilter):
         # hidden() = send_to_server | process，即「不回显但照常分发」。
         # 注意：这里**不能** return False —— 那等价于 discarded()，会把整条信息
         # 丢掉，导致 MCDR 的启动 / 停止 / 玩家进出检测失效。
-        info.action_flag = InfoActionFlag.hidden()
+        info.action_flag = self._hidden_flag
 
         with self._lock:
             rule.count += 1
@@ -145,30 +234,86 @@ class ServerLogFilter(InfoFilter):
 
 
 # --------------------------------------------------------------------------
-#  模块级状态
+#  规则装载：编译 + 灾难性回溯探测
 # --------------------------------------------------------------------------
 
-_config: Optional[Config] = None
-_log_filter: Optional[ServerLogFilter] = None
-# on_load 拿到的 PluginServerInterface。注意不能从命令的 source 取：那条路拿到的是
-# ServerInterface，并没有 load_config_simple()（它只属于 PluginServerInterface）。
-_server: Optional[PluginServerInterface] = None
+# 探测串：短到即使最坏情况也只花几百毫秒，又要长到足以把危险模式与正常模式
+# 拉开几个数量级。实测 a*22 与 a*22+"!" 能拦下常见嵌套量词模式（单串 200~450 ms），
+# 而正常规则在同一批探测串上最坏仅 1.3 µs —— 余量约两万倍。
+PROBE_SUBJECTS = (
+    "a" * 22,
+    "a" * 22 + "!",
+    "0" * 22 + "!",
+    "a " * 11 + "!",
+)
 
 
-def _build_rules(server: PluginServerInterface, patterns: List[str]) -> List[Rule]:
-    """编译规则；单条写错不影响其他规则，只在日志里报警告。"""
+def _probe_pattern(regex: Pattern, budget_ms: int) -> Optional[str]:
+    """检查正则是否存在灾难性回溯；正常返回 None，可疑则返回说明文字。
+
+    带嵌套量词的表达式（``(a+)+$`` 之类）在匹配失败时会指数级回溯。这类规则每遇到
+    一行近似日志就会冻结 MCDR 主线程：实测 ``(a+)+$`` 在 27 个字符上要 3 秒。
+    用短探测串就能提前发现——因为耗时随长度按 2^n 增长，短串上已经明显超预算的模式，
+    到了真实日志行长度只会更糟。
+    """
+    budget = budget_ms / 1000.0
+    for subject in PROBE_SUBJECTS:
+        start = time.perf_counter()
+        regex.search(subject)
+        cost = time.perf_counter() - start
+        if cost > budget:
+            return "在 {} 字符的探测串上已耗时 {:.0f} ms（上限 {} ms）".format(
+                len(subject), cost * 1000, budget_ms
+            )
+    return None
+
+
+def _build_rules(
+    server: PluginServerInterface,
+    patterns: List[str],
+    validate: bool = True,
+    probe_budget_ms: int = 25,
+) -> List[Rule]:
+    """编译规则；单条写错不影响其他规则，只在日志里报错或警告。"""
     rules: List[Rule] = []
     for raw in patterns:
         pattern = (raw or "").strip()
         if not pattern:
             continue
         try:
-            rules.append(Rule(pattern))
+            regex = re.compile(pattern)
         except re.error as error:
             server.logger.warning(
                 "过滤规则编译失败，已跳过: {!r} ({})".format(pattern, error)
             )
+            continue
+        if validate:
+            problem = _probe_pattern(regex, probe_budget_ms)
+            if problem is not None:
+                server.logger.error(
+                    "过滤规则存在灾难性回溯风险，已跳过: {!r} —— {}。"
+                    "这条规则几乎每行都会让 MCDR 主线程卡顿，请改写成普通子串或"
+                    "去掉嵌套量词后重试。".format(pattern, problem)
+                )
+                continue
+        rules.append(Rule(pattern, regex))
     return rules
+
+
+# --------------------------------------------------------------------------
+#  模块级状态
+# --------------------------------------------------------------------------
+
+_config: Optional[Config] = None
+_log_filter: Optional[ServerLogFilter] = None
+_state: Optional[State] = None
+# on_load 拿到的 PluginServerInterface。注意不能从命令的 source 取：那条路拿到的是
+# ServerInterface，并没有 load_config_simple()（它只属于 PluginServerInterface）。
+_server: Optional[PluginServerInterface] = None
+
+# 本轮服务端是否真的完成过启动。只有完成过启动的周期才计入「零命中」统计——
+# 否则服务端连续几次启动失败（比如 mod 报错）会把所有规则刷成零命中，产生假提醒。
+_session_reached_startup = False
 
 
 def _log_summary(server: PluginServerInterface, rules: List[Rule]) -> None:
@@ -182,8 +327,107 @@ def _log_summary(server: PluginServerInterface, rules: List[Rule]) -> None:
         server.logger.warning("未启用任何过滤规则（patterns 为空或全部编译失败）")
 
 
+def _load_state(server: PluginServerInterface) -> State:
+    return server.load_config_simple(
+        file_name=STATE_FILE_NAME, target_class=State, echo_in_console=False
+    )
+
+
+def _save_state(server: PluginServerInterface, state: State) -> None:
+    server.save_config_simple(state, file_name=STATE_FILE_NAME)
+
+
+def _update_state_after_session(
+    server: PluginServerInterface, state: State, rules: List[Rule]
+) -> None:
+    """一次开服周期结束时，把命中数写进历史并推进「连续零命中」计数。"""
+    state.session_index += 1
+    session_index = state.session_index
+
+    configured = set()
+    for rule in rules:
+        configured.add(rule.pattern)
+        entry = state.rules.get(rule.pattern)
+        if entry is None:
+            entry = RuleState()
+            state.rules[rule.pattern] = entry
+        entry.hits_last_session = rule.count
+        entry.total_hits += rule.count
+        if rule.count > 0:
+            entry.zero_streak = 0
+            entry.last_hit_session = session_index
+        else:
+            entry.zero_streak += 1
+
+    # 已从配置中移除的规则一并清掉，避免状态文件无限增长
+    for pattern in [p for p in state.rules if p not in configured]:
+        del state.rules[pattern]
+
+    _save_state(server, state)
+
+
+def _collect_stale(
+    state: State, rules: List[Rule], threshold: int
+) -> List[Tuple[str, RuleState]]:
+    """找出连续零命中已达阈值的规则（只关心当前配置里还在的）。"""
+    stale: List[Tuple[str, RuleState]] = []
+    for rule in rules:
+        entry = state.rules.get(rule.pattern)
+        if entry is not None and entry.zero_streak >= threshold:
+            stale.append((rule.pattern, entry))
+    return stale
+
+
+def _emit_stale_warning(
+    server: PluginServerInterface,
+    stale: List[Tuple[str, RuleState]],
+    threshold: int,
+) -> None:
+    """在开服完成（Done）之后给出一次醒目提醒。
+
+    整段拼成一条消息再发，避免控制台被几十行带时间戳的独立 WARNING 淹没。
+    """
+    lines = [
+        "",
+        "=" * 66,
+        "[ServerLogFilter] 注意：有 {} 条过滤规则连续 {} 次及以上开服都没有命中".format(
+            len(stale), threshold
+        ),
+    ]
+    for pattern, entry in stale:
+        lines.append("  · {}".format(pattern))
+        if entry.total_hits:
+            lines.append(
+                "      已连续 {} 次开服零命中；历史累计命中 {} 次，最后一次在第 {} 次开服".format(
+                    entry.zero_streak, entry.total_hits, entry.last_hit_session
+                )
+            )
+        else:
+            lines.append(
+                "      已连续 {} 次开服零命中；自启用以来从未命中过".format(entry.zero_streak)
+            )
+    lines += [
+        "  通常只有两种可能：",
+        "    1. 这条正则写错了（拼写 / 大小写 / 转义，或与当前服务端版本不匹配）",
+        "    2. 这段日志已经不再产生（例如上游 bug 已被修复）",
+        "  建议：用 !!logfilter test <一行日志> 验证规则是否还匹配；",
+        "        确认无用后从配置的 patterns 里删除该条，",
+        "        若确认只是「本来就罕见」可调大 stale_rule_threshold，",
+        "        或用 !!logfilter reset 清空计数重新观察。",
+        "  （提醒本身不影响性能，只是为了保持配置干净。）",
+        "=" * 66,
+        "",
+    ]
+    server.logger.warning("\n".join(lines))
+
+
+# --------------------------------------------------------------------------
+#  生命周期
+# --------------------------------------------------------------------------
+
+
 def on_load(server: PluginServerInterface, prev_module) -> None:
-    global _config, _log_filter, _server
+    global _config, _log_filter, _state, _server, _session_reached_startup
 
     _server = server
 
@@ -194,9 +438,26 @@ def on_load(server: PluginServerInterface, prev_module) -> None:
             "请升级 MCDR 后重试。".format(MIN_MCDR_VERSION)
         )
         return
+
     _config = server.load_config_simple(target_class=Config)
-    rules = _build_rules(server, _config.patterns)
+    _state = _load_state(server)
+    rules = _build_rules(
+        server,
+        _config.patterns,
+        validate=_config.validate_patterns,
+        probe_budget_ms=_config.pattern_probe_timeout_ms,
+    )
     _log_filter = ServerLogFilter(rules, server.logger, _config.log_matched_lines)
+
+    # 热重载：把上一份实例已有的命中数接过来，避免把一次开服周期切成两段后误判零命中。
+    carried = _log_filter.carry_over_from(getattr(prev_module, "_log_filter", None))
+    if carried:
+        server.logger.info("已从重载前的实例接续 {} 条命中计数".format(carried))
+
+    # 真实的重载会构造一个全新的模块，本模块的 _session_reached_startup 会回到 False。
+    # 若服务端当时正在运行，这次重载就会把当前周期从统计里抹掉，所以要把状态一并接续。
+    if getattr(prev_module, "_session_reached_startup", False):
+        _session_reached_startup = True
 
     # InfoFilter 必须在插件加载阶段（on_load）注册。MCDR 会在本插件卸载时
     # 自动移除它，无需手动反注册。
@@ -214,6 +475,11 @@ def on_load(server: PluginServerInterface, prev_module) -> None:
             .requires(lambda src: src.has_permission(PermissionLevel.ADMIN))
             .runs(_reload)
         )
+        .then(
+            Literal("reset")
+            .requires(lambda src: src.has_permission(PermissionLevel.ADMIN))
+            .runs(_reset_streaks)
+        )
         .then(Literal("test").then(GreedyText("text").runs(_test_line)))
     )
 
@@ -224,7 +490,12 @@ def _apply_config(server: PluginServerInterface) -> List[Rule]:
     """重读配置并就地替换规则，不重新注册命令与过滤器。"""
     global _config
     _config = server.load_config_simple(target_class=Config)
-    rules = _build_rules(server, _config.patterns)
+    rules = _build_rules(
+        server,
+        _config.patterns,
+        validate=_config.validate_patterns,
+        probe_budget_ms=_config.pattern_probe_timeout_ms,
+    )
     if _log_filter is not None:
         _log_filter.reload_rules(rules, _config.log_matched_lines)
     return rules
@@ -232,17 +503,55 @@ def _apply_config(server: PluginServerInterface) -> List[Rule]:
 
 def on_server_start(server: PluginServerInterface) -> None:
     # 每轮服务端从零计数，这样停止时的汇总才是「本次运行」的准确数字。
+    global _session_reached_startup
+    _session_reached_startup = False
     if _log_filter is not None:
         _log_filter.reset_counters()
 
 
-def on_server_stop(server: PluginServerInterface, server_return_code: int) -> None:
-    if _log_filter is None or _config is None or not _config.report_on_server_stop:
+def on_server_startup(server: PluginServerInterface) -> None:
+    """服务端完成启动（控制台出现 ``Done``）时触发。
+
+    零命中提醒放在这里而不是 on_server_start：开服瞬间日志量很大，
+    提醒会被淹没；等 Done 之后再报才醒目。
+    """
+    global _session_reached_startup
+    _session_reached_startup = True
+
+    if (
+        not _config.warn_about_stale_rules
+        or _state is None
+        or _log_filter is None
+        or _config.stale_rule_threshold <= 0
+    ):
         return
-    if _log_filter.total:
+
+    stale = _collect_stale(_state, list(_log_filter.rules), _config.stale_rule_threshold)
+    if stale:
+        _emit_stale_warning(server, stale, _config.stale_rule_threshold)
+
+
+def on_server_stop(server: PluginServerInterface, server_return_code: int) -> None:
+    global _session_reached_startup
+
+    if _log_filter is None or _config is None:
+        return
+
+    # 只有真正完成过启动的周期才计入统计，避免「启动失败」污染零命中计数。
+    if _session_reached_startup and _state is not None:
+        try:
+            _update_state_after_session(server, _state, list(_log_filter.rules))
+        except Exception:  # noqa: BLE001 - 状态写盘失败不应影响服务端收尾
+            server.logger.exception("写入日志过滤统计（state.json）失败")
+    _session_reached_startup = False
+
+    if not _config.report_on_server_stop:
+        return
+    total = _log_filter.total
+    if total:
         server.logger.info(
             "本次运行共从 MCDR 控制台隐去 {} 行服务端日志（服务端日志文件不受影响）".format(
-                _log_filter.total
+                total
             )
         )
 
@@ -257,25 +566,41 @@ def _show_status(source) -> None:
         source.reply(RText("日志过滤器尚未初始化", RColor.red))
         return
 
+    rules = _log_filter.rules
     parts = RTextList(
         RText("------ Server Log Filter ------", RColor.aqua),
         "\n",
         RText("规则数: ", RColor.gray),
-        RText(str(len(_log_filter.rules)), RColor.green),
+        RText(str(len(rules)), RColor.green),
         RText("    本次已隐去: ", RColor.gray),
         RText(str(_log_filter.total), RColor.green),
         RText(" 行", RColor.gray),
     )
 
-    if not _log_filter.rules:
+    if not rules:
         parts.append("\n")
         parts.append(RText("（无规则，请在配置文件 patterns 里填写）", RColor.yellow))
 
-    for index, rule in enumerate(_log_filter.rules, start=1):
+    threshold = _config.stale_rule_threshold if _config is not None else 0
+    for index, rule in enumerate(rules, start=1):
         parts.append("\n")
         parts.append(RText(" [{:>2}] ".format(index), RColor.dark_gray))
         parts.append(RText("{:>5} 次  ".format(rule.count), RColor.green))
         parts.append(RText(rule.pattern, RColor.white))
+        entry = _state.rules.get(rule.pattern) if _state is not None else None
+        if entry is not None and entry.zero_streak:
+            if threshold and entry.zero_streak >= threshold:
+                parts.append(RText("   ⚠ 连续 {} 次开服零命中".format(entry.zero_streak), RColor.red))
+            else:
+                parts.append(
+                    RText("   （连续 {} 次零命中）".format(entry.zero_streak), RColor.dark_gray)
+                )
+
+    if _state is not None and _state.session_index:
+        parts.append("\n")
+        parts.append(
+            RText("已统计 {} 个开服周期".format(_state.session_index), RColor.dark_gray)
+        )
 
     parts.append("\n")
     parts.append(
@@ -299,6 +624,29 @@ def _reload(source) -> None:
         RTextList(
             RText("已重载日志过滤规则", RColor.green),
             RText("（当前 {} 条）".format(len(rules)), RColor.gray),
+        )
+    )
+
+
+def _reset_streaks(source) -> None:
+    """清空「连续零命中」计数，用于「确认这条规则本来就罕见，别再来烦我」。"""
+    if _server is None or _state is None or _log_filter is None:
+        source.reply(RText("插件尚未初始化，无法重置", RColor.red))
+        return
+    cleared = 0
+    for rule in _log_filter.rules:
+        entry = _state.rules.get(rule.pattern)
+        if entry is not None and entry.zero_streak:
+            entry.zero_streak = 0
+            cleared += 1
+    try:
+        _save_state(_server, _state)
+    except Exception:  # noqa: BLE001
+        _server.logger.exception("写入 state.json 失败")
+    source.reply(
+        RTextList(
+            RText("已重置连续零命中计数", RColor.green),
+            RText("（涉及 {} 条规则）".format(cleared), RColor.gray),
         )
     )
 

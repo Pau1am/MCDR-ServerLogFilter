@@ -20,8 +20,11 @@ Run:  python -m pytest tests -v
 import importlib
 import json
 import pathlib
+import re
 import shutil
+import sys
 import tempfile
+import time
 import zipfile
 
 import pytest
@@ -83,12 +86,15 @@ class FakeSource:
 
 
 class FakePluginServer:
-    def __init__(self, logger=None):
+    def __init__(self, logger=None, config_data=None, state_data=None):
         self.logger = logger or RecordingLogger()
         self.info_filters = []
         self.help_messages = []
         self.commands = []
         self.config = None
+        self.config_data = config_data
+        self.state_data = state_data
+        self.saved = {}
 
     def register_info_filter(self, f):
         self.info_filters.append(f)
@@ -99,9 +105,14 @@ class FakePluginServer:
     def register_command(self, cmd):
         self.commands.append(cmd)
 
-    def load_config_simple(self, target_class=None, **kwargs):
-        self.config = target_class()
+    def load_config_simple(self, file_name=None, target_class=None, **kwargs):
+        if file_name == slf.STATE_FILE_NAME:
+            return target_class.deserialize(self.state_data or {})
+        self.config = target_class.deserialize(self.config_data or {})
         return self.config
+
+    def save_config_simple(self, config, file_name=None, **kwargs):
+        self.saved[file_name] = config.serialize()
 
 
 # The set of noisy lines this plugin exists to suppress (server side, MC 26.3).
@@ -314,6 +325,10 @@ def test_config_defaults_match_documented_json():
     assert data["patterns"] == [slf.DEFAULT_PATTERN]
     assert data["log_matched_lines"] is False
     assert data["report_on_server_stop"] is True
+    assert data["warn_about_stale_rules"] is True
+    assert data["stale_rule_threshold"] == 3
+    assert data["validate_patterns"] is True
+    assert data["pattern_probe_timeout_ms"] == 25
 
 
 def test_config_deserializes_from_json_like_dict():
@@ -615,3 +630,448 @@ def test_packager_root_entries_would_be_illegal_if_denylisted():
     type(checker)._ILLEGAL_ROOT_PY_FILE_STEM = packed.PackedPlugin._ILLEGAL_ROOT_PY_FILE_STEM
     with pytest.raises(packed.IllegalPluginStructure):
         packed.PackedPlugin._check_dir_legality(checker)
+
+
+# ---------------------------------------------------------------------------
+#  8. stale-rule detection
+# ---------------------------------------------------------------------------
+
+IDLE = "a-rule-that-never-matches"
+LIVE = slf.DEFAULT_PATTERN
+
+
+def start_plugin(config=None, state=None):
+    """Boot the plugin against a fake server and return (server, state_module)."""
+    server = FakePluginServer(config_data=config, state_data=state)
+    slf.on_load(server, None)
+    return server
+
+
+def run_session(server, hits=None, reach_startup=True):
+    """Simulate one full server session: start -> startup -> stop.
+
+    ``hits`` maps pattern -> how many lines that rule matched during the session.
+    """
+    slf.on_server_start(server)
+    if reach_startup:
+        slf.on_server_startup(server)
+    hits = hits or {}
+    for rule in slf._log_filter.rules:
+        rule.count = hits.get(rule.pattern, 0)
+    slf.on_server_stop(server, 0)
+
+
+def warnings_of(server):
+    return "\n".join(server.logger.warnings)
+
+
+def test_idle_rule_is_reported_once_the_streak_reaches_the_threshold():
+    server = start_plugin(
+        config={"patterns": [LIVE, IDLE], "stale_rule_threshold": 2}
+    )
+    # session 1 and 2: the idle rule never matches -> streak grows to 2
+    run_session(server, hits={LIVE: 5})
+    assert IDLE not in warnings_of(server), "must not warn before the threshold is reached"
+    run_session(server, hits={LIVE: 5})
+    assert IDLE not in warnings_of(server), "the warning belongs to the NEXT startup"
+
+    # session 3: the startup now sees streak == 2 and speaks up
+    slf.on_server_start(server)
+    slf.on_server_startup(server)
+    text = warnings_of(server)
+    assert IDLE in text
+    assert "连续 2 次及以上开服都没有命中" in text
+    assert "已连续 2 次开服零命中" in text
+    assert "从未命中过" in text
+    # the rule that is working is not mentioned
+    assert LIVE not in text
+
+
+def test_a_matching_rule_never_becomes_stale():
+    server = start_plugin(config={"patterns": [LIVE], "stale_rule_threshold": 1})
+    for _ in range(5):
+        run_session(server, hits={LIVE: 3})
+        slf.on_server_start(server)
+        slf.on_server_startup(server)
+        assert "都没有命中" not in warnings_of(server)
+
+
+def test_a_single_hit_resets_the_streak():
+    server = start_plugin(config={"patterns": [IDLE], "stale_rule_threshold": 2})
+
+    def streak():
+        return slf._state.rules[IDLE].zero_streak
+
+    run_session(server)
+    run_session(server)
+    assert streak() == 2
+
+    run_session(server, hits={IDLE: 1})  # rule fires once
+    assert streak() == 0
+
+    run_session(server)
+    assert streak() == 1
+
+
+def test_a_session_that_never_reached_startup_is_not_counted():
+    """A server that fails to boot must not be able to fake an 'idle rule'.
+
+    Otherwise three consecutive crashes would make every rule look unused and
+    produce a bogus warning.
+    """
+    server = start_plugin(config={"patterns": [IDLE], "stale_rule_threshold": 2})
+    for _ in range(5):
+        run_session(server, reach_startup=False)
+    assert slf._state.session_index == 0, "failed startups must not advance the history"
+    assert IDLE not in slf._state.rules
+
+    slf.on_server_start(server)
+    slf.on_server_startup(server)
+    assert "都没有命中" not in warnings_of(server)
+
+
+def test_warning_can_be_switched_off():
+    server = start_plugin(
+        config={"patterns": [IDLE], "warn_about_stale_rules": False, "stale_rule_threshold": 1}
+    )
+    run_session(server)
+    slf.on_server_start(server)
+    slf.on_server_startup(server)
+    assert IDLE not in warnings_of(server)
+    # ...but the statistics are still collected, just not announced
+    assert slf._state.rules[IDLE].zero_streak == 1
+
+
+def test_threshold_zero_disables_the_warning():
+    server = start_plugin(config={"patterns": [IDLE], "stale_rule_threshold": 0})
+    for _ in range(4):
+        run_session(server)
+        slf.on_server_start(server)
+        slf.on_server_startup(server)
+    assert "都没有命中" not in warnings_of(server)
+
+
+def test_state_forgets_patterns_that_left_the_config():
+    server = start_plugin(config={"patterns": [LIVE, IDLE], "stale_rule_threshold": 1})
+    run_session(server)
+    assert set(slf._state.rules) == {LIVE, IDLE}
+
+    # the admin removes the idle rule
+    server.config_data = {"patterns": [LIVE], "stale_rule_threshold": 1}
+    slf._apply_config(server)
+    run_session(server)
+    assert set(slf._state.rules) == {LIVE}, "removed patterns must be pruned from the state file"
+
+
+def test_state_file_round_trips_through_json():
+    server = start_plugin(config={"patterns": [IDLE], "stale_rule_threshold": 1})
+    run_session(server)
+    saved = server.saved[slf.STATE_FILE_NAME]
+
+    import json as _json
+
+    again = slf.State.deserialize(_json.loads(_json.dumps(saved)))
+    assert again.serialize() == saved
+
+
+def test_history_is_kept_between_runs():
+    first = start_plugin(config={"patterns": [IDLE], "stale_rule_threshold": 2})
+    run_session(first)
+    carried = first.saved[slf.STATE_FILE_NAME]
+
+    # a fresh process picks up the file the previous one wrote
+    second = start_plugin(config={"patterns": [IDLE], "stale_rule_threshold": 2}, state=carried)
+    assert slf._state.session_index == 1
+    run_session(second)
+    assert second.saved[slf.STATE_FILE_NAME]["rules"][IDLE]["zero_streak"] == 2
+
+
+def test_reload_does_not_fake_an_idle_session():
+    """A plugin reload mid-session must not restart the counters from zero.
+
+    If counts were dropped, a rule that had actually matched would look idle for
+    that session and could push an innocent rule over the threshold.
+    """
+    server = start_plugin(config={"patterns": [LIVE], "stale_rule_threshold": 1})
+    slf.on_server_start(server)
+    slf.on_server_startup(server)
+    for _ in range(4):
+        slf._log_filter.filter_server_info(
+            FakeInfo("Player Steve standing on air - force-sending blocks below")
+        )
+    assert slf._log_filter.total == 4
+
+    # !!MCDR reload plugin -> on_load runs again with the PREVIOUS module.
+    # MCDR hands the old module object in; simulate that faithfully, because the
+    # new module overwrites the globals before carry_over_from() is called.
+    old_filter = slf._log_filter
+
+    class PreviousModule:
+        _log_filter = old_filter
+
+    slf.on_load(server, PreviousModule)
+    assert slf._log_filter is not old_filter, "reload must build a fresh filter"
+    assert slf._log_filter.total == 4, "counters must survive a plugin reload"
+
+    slf.on_server_stop(server, 0)
+    assert slf._state.rules[LIVE].zero_streak == 0
+    assert slf._state.rules[LIVE].hits_last_session == 4
+
+
+def test_reload_carries_the_running_session_over_to_the_new_module():
+    """A real reload builds a *fresh* module, so the 'startup happened' flag resets.
+
+    If the flag were dropped, the reloaded plugin would skip recording the session
+    entirely and the server's uptime would silently disappear from the statistics.
+    """
+    server = start_plugin(config={"patterns": [LIVE], "stale_rule_threshold": 1})
+    slf.on_server_start(server)
+    slf.on_server_startup(server)
+    old_filter = slf._log_filter
+
+    class PreviousModule:
+        _log_filter = old_filter
+        _session_reached_startup = True
+
+    # simulate the brand-new module MCDR hands to on_load
+    slf._session_reached_startup = False
+    slf.on_load(server, PreviousModule)
+    assert slf._session_reached_startup is True, "the running session must survive a reload"
+
+    slf.on_server_stop(server, 0)
+    assert slf._state.session_index == 1, "the session must still be recorded"
+
+
+def test_status_command_surfaces_the_streak():
+    server = start_plugin(config={"patterns": [IDLE], "stale_rule_threshold": 2})
+    run_session(server)
+    run_session(server)
+
+    source = FakeSource()
+    slf._show_status(source)
+    text = "".join(str(x) for x in source.replies)
+    assert "连续 2 次开服零命中" in text
+    assert "已统计 2 个开服周期" in text
+
+
+def test_reset_command_clears_the_streak():
+    server = start_plugin(config={"patterns": [IDLE], "stale_rule_threshold": 1})
+    run_session(server)
+    assert slf._state.rules[IDLE].zero_streak == 1
+
+    source = FakeSource()
+    slf._reset_streaks(source)
+    assert slf._state.rules[IDLE].zero_streak == 0
+    assert "已重置" in "".join(str(x) for x in source.replies)
+    assert server.saved[slf.STATE_FILE_NAME]["rules"][IDLE]["zero_streak"] == 0
+
+
+# ---------------------------------------------------------------------------
+#  9. catastrophic-backtracking guard
+# ---------------------------------------------------------------------------
+
+# Patterns a user could plausibly write, all of which must survive the probe.
+REALISTIC_PATTERNS = [
+    r"standing on air - force-sending blocks below",
+    r"Player \w+ .*",
+    r"joined the game|left the game",
+    r"moved too quickly! [\d\.,]+",
+    r"^\S+ has too many items",
+    r"(?:Rejecting|Ignoring) \w+",
+    r"Ignoring chat session from \S+ due to missing Services public key",
+    r"Preparing spawn area: \d+%",
+]
+
+
+@pytest.mark.parametrize("pattern", REALISTIC_PATTERNS)
+def test_realistic_patterns_pass_the_probe(pattern):
+    server = FakePluginServer()
+    rules = slf._build_rules(server, [pattern])
+    assert [r.pattern for r in rules] == [pattern]
+    assert server.logger.errors == []
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [r"(a+)+$", r"^(a|a)*$", r"(\w+\s?)*$", r"(a*)*b"],
+)
+def test_catastrophic_patterns_are_refused(pattern):
+    """These freeze MCDR's main thread for hundreds of ms per line, so they must go."""
+    server = FakePluginServer()
+    rules = slf._build_rules(server, [pattern])
+    assert rules == []
+    assert any("灾难性回溯" in msg for msg in server.logger.errors)
+
+
+def test_one_bad_pattern_does_not_take_down_the_others():
+    server = FakePluginServer()
+    rules = slf._build_rules(server, [LIVE, r"(a+)+$", "joined the game"])
+    assert [r.pattern for r in rules] == [LIVE, "joined the game"]
+
+
+def test_probe_can_be_turned_off():
+    server = FakePluginServer()
+    rules = slf._build_rules(server, [r"(a+)+$"], validate=False)
+    assert [r.pattern for r in rules] == [r"(a+)+$"]
+
+
+def test_on_load_actually_applies_the_probe():
+    """The guard must be wired into the real load path, not merely callable.
+
+    Without this, disabling `validate_patterns` inside ``on_load`` would go
+    unnoticed while every direct ``_build_rules`` test kept passing.
+    """
+    server = start_plugin(config={"patterns": [LIVE, r"(a+)+$"]})
+    assert [r.pattern for r in slf._log_filter.rules] == [LIVE]
+    assert any("灾难性回溯" in msg for msg in server.logger.errors)
+
+
+def test_on_load_respects_validate_patterns_false():
+    server = start_plugin(config={"patterns": [r"(a+)+$"], "validate_patterns": False})
+    assert [r.pattern for r in slf._log_filter.rules] == [r"(a+)+$"]
+    assert server.logger.errors == []
+
+
+def test_on_load_honours_the_timeout_setting():
+    """A budget of 0 ms must trip even a benign pattern, proving the knob is wired."""
+    server = start_plugin(
+        config={"patterns": [LIVE], "pattern_probe_timeout_ms": 0}
+    )
+    assert slf._log_filter.rules == ()
+    assert any("灾难性回溯" in msg for msg in server.logger.errors)
+
+
+def test_probing_realistic_patterns_stays_cheap():
+    """Load-time validation must not turn into a startup delay.
+
+    8 realistic patterns cost microseconds in practice; the bound is deliberately
+    loose so this stays a regression guard rather than a flaky benchmark.
+    """
+    server = FakePluginServer()
+    start = time.perf_counter()
+    rules = slf._build_rules(server, REALISTIC_PATTERNS)
+    elapsed = time.perf_counter() - start
+
+    assert len(rules) == len(REALISTIC_PATTERNS)
+    assert server.logger.errors == []
+    assert elapsed < 0.1, "pattern validation became expensive: {:.3f}s".format(elapsed)
+
+
+def test_per_line_filtering_stays_in_the_microsecond_range():
+    """A blunt but real guard: filtering must not cost milliseconds per line.
+
+    1000 lines with 5 rules should be well under 20 ms (measured: ~1 ms).
+    """
+    patterns = [LIVE] + ["noise-marker-{}".format(i) for i in range(4)]
+    f = slf.ServerLogFilter([slf.Rule(p) for p in patterns], RecordingLogger(), False)
+    lines = ["Player Steve standing on air - force-sending blocks below",
+             "Steve joined the game"] * 500
+    infos = [FakeInfo(line) for line in lines]
+
+    start = time.perf_counter()
+    for info in infos:
+        f.filter_server_info(info)
+    elapsed = time.perf_counter() - start
+
+    per_line_us = elapsed / len(infos) * 1e6
+    assert elapsed < 0.02, "filtering {:.1f} µs/line is too slow".format(per_line_us)
+
+
+def test_probe_accepts_a_compiled_regex_without_recompiling():
+    rx = re.compile(LIVE)
+    rule = slf.Rule(LIVE, rx)
+    assert rule.regex is rx
+
+
+def test_rule_pattern_is_stripped_and_blank_ones_skipped():
+    server = FakePluginServer()
+    rules = slf._build_rules(server, ["  " + LIVE + "  ", "", None, "   "])
+    assert [r.pattern for r in rules] == [LIVE]
+
+
+# ---------------------------------------------------------------------------
+#  10. lightweight invariants (the hot path must stay cheap)
+# ---------------------------------------------------------------------------
+
+
+def test_hidden_flag_is_built_once_and_reused():
+    """InfoActionFlag.hidden() allocates a new flag; the hot path must not call it."""
+    f = make_filter()
+    assert f._hidden_flag is not None
+    assert f._hidden_flag is f._hidden_flag
+
+    info = FakeInfo("Player Steve standing on air - force-sending blocks below")
+    f.filter_server_info(info)
+    assert info.action_flag is f._hidden_flag, "each hit must reuse the cached flag"
+
+
+def test_rules_are_stored_immutably():
+    f = make_filter([LIVE, "joined the game"])
+    assert isinstance(f.rules, tuple)
+
+
+def test_no_rules_short_circuits_before_reading_the_line():
+    """With nothing to filter the plugin must not even touch the info object."""
+
+    class ProbeInfo:
+        def __init__(self):
+            self.action_flag = "UNTOUCHED"
+            self.content_reads = 0
+
+        @property
+        def content(self):
+            self.content_reads += 1
+            return "Player Steve standing on air - force-sending blocks below"
+
+        @property
+        def raw_content(self):
+            self.content_reads += 1
+            return "Player Steve standing on air - force-sending blocks below"
+
+    info = ProbeInfo()
+    f = slf.ServerLogFilter([], RecordingLogger(), False)
+    f.filter_server_info(info)
+    assert info.content_reads == 0
+    assert info.action_flag == "UNTOUCHED"
+
+
+def test_non_matching_line_leaves_the_action_flag_alone():
+    f = make_filter()
+    info = FakeInfo("Steve joined the game")
+    f.filter_server_info(info)
+    assert info.action_flag == "UNTOUCHED"
+
+
+def test_matching_stops_at_the_first_rule():
+    """Rule order decides, and later rules are not even evaluated."""
+    expensive = slf.Rule(r"never-matches-this-\d")
+    f = slf.ServerLogFilter([slf.Rule(LIVE), expensive], RecordingLogger(), False)
+    info = FakeInfo("Player Steve standing on air - force-sending blocks below")
+    f.filter_server_info(info)
+    assert f.rules[0].count == 1
+    assert expensive.count == 0
+
+
+def test_state_tracking_adds_no_work_to_the_per_line_path():
+    """The new feature must be free per line: all bookkeeping happens at session edges.
+
+    Proven structurally — filter_server_info never touches the State object.
+    """
+    server = start_plugin(config={"patterns": [LIVE], "stale_rule_threshold": 1})
+    slf.on_server_start(server)
+    slf.on_server_startup(server)
+
+    touched = []
+    original_save = server.save_config_simple
+
+    def spy(config, file_name=None, **kwargs):
+        touched.append(file_name)
+        return original_save(config, file_name=file_name, **kwargs)
+
+    server.save_config_simple = spy
+    for _ in range(50):
+        slf._log_filter.filter_server_info(
+            FakeInfo("Player Steve standing on air - force-sending blocks below")
+        )
+    assert touched == [], "per-line filtering must not write the state file"
+    assert slf._log_filter.total == 50

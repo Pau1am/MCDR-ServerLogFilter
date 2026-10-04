@@ -6,6 +6,71 @@
 
 ---
 
+## [1.1.0] - 2026-10-04
+
+### 新增
+
+1. **零命中提醒。** 某条规则如果连续若干个开服周期一次都没命中，会在下一次**开服完成
+   （控制台出现 `Done`）之后**提醒一次，列出规则原文、连续零命中次数与历史命中情况，
+   并给出处置建议。用于发现写错的规则、以及发现「日志已不再产生、规则可以删了」。
+   - 新配置 `warn_about_stale_rules`（默认 `true`）、`stale_rule_threshold`（默认 `3`，设 `0` 关闭）
+   - 统计存放在 `config/server_log_filter/state.json`，与用户手写的 `config.json` **分开**，互不干扰
+   - 只在**完成过启动**的周期上统计；服务端启动失败不会把规则刷成零命中
+   - 插件热重载时会把已有点击计数接续过来，避免把一次开服周期切成两段后误判
+   - 新命令 `!!logfilter reset`（admin）：清空连续零命中计数
+   - `!!logfilter` 状态输出中会标出各规则的连续零命中次数
+
+2. **正则安全检查。** 载入时用短探测串检查每条规则是否存在灾难性回溯，命中则跳过该规则并报错。
+   带嵌套量词的正则（如 `(a+)+$`）实测**单行**即可耗时数百毫秒乃至数秒，会冻结 MCDR 主线程。
+   - 新配置 `validate_patterns`（默认 `true`）、`pattern_probe_timeout_ms`（默认 `25`）
+   - 该检查只在载入时执行一次，正常规则耗时微秒级
+
+### 优化
+
+- `InfoActionFlag.hidden()` 改为构造时计算一次并复用（它是不变常量），去掉命中路径上的一次函数调用
+- 无规则时直接短路返回，不再取日志正文
+- 规则容器改为 `tuple`（迭代略快，且避免外部误改；整体赋值天然原子）
+- 正则只编译一次：校验用过的编译结果直接交给匹配使用
+
+> **关于性能的说明**：上述优化加起来约减少 10% 的单行开销，但绝对值本来就极小——实测
+> 单行过滤约 0.2 µs，不到 MCDR 自身解析同一行开销的十分之一；即便 1000 行/秒的极端突发，
+> 每小时累计也只有 0.7 秒。真正会拖慢服务端的是**写坏的正则**（见上），而不是规则条数。
+> 数字可用 `benchmarks/bench_filter.py` 复现。
+
+### 变更
+
+- 版本号 1.0.2 → 1.1.0
+
+### 仓库内新增工具（不随插件包分发）
+
+- `benchmarks/bench_filter.py` —— 性能基准，上文那些数字都由它产出，可自行复跑
+- `tools/mutation_check.py` —— 变异检查：故意改坏实现，确认测试会变红
+- `tools/mcdr_matrix.py` —— 跨 MCDR 版本矩阵：传入若干装了 MCDR 的解释器，
+  自动核对加载、过滤、提醒、状态文件与命令树
+
+### 兼容性
+
+**最低 MCDR 版本要求没有变化，仍是 2.15.0。**
+
+原因是门槛只由 `InfoActionFlag` 决定（2.15.0 引入），而本次新增功能用到的其它 API
+——`save_config_simple`、带 `file_name` 的 `load_config_simple`、嵌套 `Serializable`、
+`on_server_startup`——经逐版本检查，**自 MCDR 2.13.0 起就全部存在**。
+
+| MCDR 版本 | 结果 |
+| --- | --- |
+| 2.13.0 / 2.14.1 | 仍被依赖检查拦下，提示「依赖项 mcdreforged@x.y.z 不满足版本约束 >=2.15.0」 |
+| **2.15.0**（最低支持） | 加载、过滤、零命中提醒、状态文件、命令（含 `!!logfilter reset`）全部通过 |
+| 2.15.7 / 2.16.0 | 同上，全部通过 |
+
+在 2.15.0 / 2.15.7 / 2.16.0 上，**新功能行为完全一致**，已逐项实测确认：
+提醒出现时机（在 `Done` 之后）、提醒内容（规则名 / 连续次数 / 「从未命中过」）、
+`session_index` 与连续零命中计数的推进、状态文件写入、命令树（`!!logfilter` 及
+`list` / `reload` / `reset` / `test` 四个子命令）、以及零运行时异常。
+
+MC 侧结论不变：过滤在 MCDR 侧完成，**与 MC 版本无耦合**。
+
+---
+
 ## [1.0.2] - 2026-10-02
 
 ### 修复
@@ -60,6 +125,7 @@
 - 配置：`config/server_log_filter/config.json` 的 `patterns[]` / `log_matched_lines` / `report_on_server_stop`。
 - 匹配使用 `re.search`（包含匹配），正则**不要**自己加 `.*`。
 
+[1.1.0]: https://github.com/Pau1am/MCDR-ServerLogFilter/releases/tag/v1.1.0
 [1.0.2]: https://github.com/Pau1am/MCDR-ServerLogFilter/releases/tag/v1.0.2
 [1.0.1]: https://github.com/Pau1am/MCDR-ServerLogFilter/releases/tag/v1.0.1
 [1.0.0]: https://github.com/Pau1am/MCDR-ServerLogFilter/releases/tag/v1.0.0
