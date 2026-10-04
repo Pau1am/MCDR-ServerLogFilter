@@ -59,6 +59,7 @@ MCDR 会把服务端打印的每一行原样回显到控制台。绝大多数情
 
 ```json
 {
+    "language": "auto",
     "patterns": [
         "standing on air - force-sending blocks below"
     ],
@@ -75,6 +76,7 @@ MCDR 会把服务端打印的每一行原样回显到控制台。绝大多数情
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
+| `language` | `string` | `"auto"` | 提示语言。`auto` = 跟随 MCDR 的 `language` 设置；也可写 `zh_cn` / `en_us`，见[界面语言](#界面语言简体中文--english) |
 | `patterns` | `string[]` | 见上 | 正则规则列表。对每行日志的**正文**（MCDR 已剥掉 `[时间] [线程/级别]:` 前缀）做匹配，命中即隐去 |
 | `log_matched_lines` | `bool` | `false` | 调试用。设为 `true` 会把被隐去的行以 INFO 级别写进 MCDR 日志，方便确认规则生效 |
 | `report_on_server_stop` | `bool` | `true` | 服务端停止时，在 MCDR 日志里汇总本次共隐去多少行 |
@@ -90,6 +92,34 @@ MCDR 会把服务端打印的每一行原样回显到控制台。绝大多数情
 > 反过来要注意：**正则里的 `.` 匹配任意字符**，想匹配字面点号请写 `\.`。
 
 > 配置文件是 JSON，**语法上不支持写注释**——每一行的含义见上表。
+
+### 界面语言（简体中文 / English）
+
+插件说给人听的每一句话——控制台提示、日志、`!!logfilter` 的回执——都在语言文件里，
+由 `language` 决定用哪一份：
+
+| 取值 | 效果 |
+|---|---|
+| `auto`（默认） | **跟随 MCDR 当前的语言**（MCDR `config.yml` 里的 `language`）——你把 MCDR 设成中文，插件就说中文，无需任何配置 |
+| `zh_cn` | 简体中文，无论 MCDR 设成什么 |
+| `en_us` | English，无论 MCDR 设成什么 |
+
+- 大小写与 `-` / `_` 都随意：`zh-CN`、`EN_us`、`en` 都能认。
+- 没有对应语言文件时回落到 `en_us`，并在日志里提醒一句——静默换语言比报错更难查。
+- MCDR 设成 `zh_tw` 而插件暂时没有繁体文件时会用 `zh_cn`，与 MCDR 自己的回落顺序一致。
+- 配置文件写坏时，这个值只能从**你的文件原文**里读（配置已经解析失败了），
+  所以写在语法错误之后也照样有效，那段「配置被重置」的播报会用它选语言。
+- 改完用 `!!logfilter reload` 立即生效，不必重启服务端。
+
+> **`auto` 读的是 MCDR 当前 `config.yml` 里的 `language`，不是什么内置默认值。**
+> 也就是说你把 MCDR 设成 `zh_cn`，插件就说中文——**不需要配置任何东西**。
+> 反过来，只有当你**从来没改过** MCDR 的语言时（MCDR 出厂默认是 `en_us`），
+> 升级到 1.2.2 之后插件提示才会是英文；这时把 `language` 设成 `zh_cn` 即可。
+
+**想加一门语言？** 复制 `en_us.json` 改成 `<语言代码>.json`（如 `ja_jp.json`、`zh_tw.json`）、
+只翻译取值、跑一次 `pytest tests -k language`，然后提 PR 就行——**不需要改任何代码**。
+文件都在 `server_log_filter/lang/`，同目录下的 `README.md` 是写给译者的说明。
+`en_us` 是回落语言，请保持完整。
 
 ### 升级后配置会自动补齐，并告诉你补了什么
 
@@ -258,6 +288,13 @@ JSON 对格式很严格，手工往 `patterns` 里加规则时**漏掉一个逗�
 [ServerLogFilter] 本次运行共从 MCDR 控制台隐去 3 行服务端日志（服务端日志文件不受影响）
 ```
 
+MCDR 是英文、或 `language` 设成 `en_us` 时，这两句会是对应的英文：
+
+```
+[ServerLogFilter] Enabled 1 log filter rule(s); matches are hidden from the MCDR console only, the server log is unaffected
+[ServerLogFilter] Hidden 3 server log line(s) from the MCDR console this run (the server log file is unaffected)
+```
+
 那些被隐去的行，在 `server/logs/latest.log` 里**依然完整存在**。
 
 ## 遇到问题
@@ -266,6 +303,7 @@ JSON 对格式很严格，手工往 `patterns` 里加规则时**漏掉一个逗�
 |---|---|
 | 规则好像没生效 | `!!logfilter test <一行日志>` 看它会不会被隐去；确认后 `!!logfilter reload` |
 | 提示某条规则长期没命中 | 正则可能写错了，或者那段日志已不再产生；按提示里的建议处理 |
+| 提示突然变成英文（或中文） | `language` 默认 `auto`，跟随 MCDR 的语言；想固定就写成 `zh_cn` 或 `en_us` |
 | 配置文件被重置了 | 找 `config.json.old`，那是你原来的文件；报错信息会写清原因和出错的行号 |
 | 想临时关掉过滤 | 把 `patterns` 清空，再 `!!logfilter reload` |
 

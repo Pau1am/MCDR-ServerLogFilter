@@ -10,6 +10,8 @@ on each one:
 * target lines are hidden while unrelated lines survive;
 * the idle-rule reminder appears, and only *after* the server printed ``Done``;
 * ``state.json`` is written and the session/streak bookkeeping advances;
+* the messages come out in Chinese, which is also what proves ``language: auto``
+  follows MCDR's own setting on that MCDR version (the instance is pinned to zh_cn);
 * the command tree registers (``!!logfilter`` plus list/reload/reset/test);
 * no traceback comes out of the plugin.
 
@@ -118,7 +120,13 @@ def run_one(python: str, plugin: Path, workdir: Path) -> dict:
 
     # Seed a config that exercises both an idle rule and a working one, plus a
     # pre-existing history so the reminder has something to report immediately.
+    #
+    # ``language: auto`` is deliberate: MCDR_CONFIG below pins MCDR to zh_cn, so every
+    # Chinese assertion in this file also proves that ``auto`` really follows MCDR on
+    # *this* MCDR version. If ``get_mcdr_language()`` were missing from one of them the
+    # plugin would fall back to en_us and the "loaded" check below would fail.
     write(root / "config" / PLUGIN_ID / "config.json", json.dumps({
+        "language": "auto",
         "patterns": [TARGET, IDLE, HITTER],
         "log_matched_lines": False,
         "report_on_server_stop": True,
@@ -185,6 +193,10 @@ def run_one(python: str, plugin: Path, workdir: Path) -> dict:
         "python": python,
         "loaded": loaded,
         "refused_cleanly": dep_blocked,
+        # The config says ``language: auto`` and MCDR_CONFIG pins MCDR to zh_cn, so the
+        # plugin must speak Chinese here on every version. An MCDR without
+        # ``get_mcdr_language()`` would fall back to English and show up right here.
+        "spoke_chinese": loaded and "Enabled 3 log filter rule(s)" not in out,
         "target_lines_hidden": ("INFO]: Player Steve " + TARGET) not in out,
         "hitter_hidden": ("INFO]: " + HITTER) not in out,
         "unrelated_kept": UNRELATED in out,
@@ -213,7 +225,8 @@ def verdict(r: dict) -> str:
             r["warning_shown"], r["warning_after_startup"], r["warning_names_rule"],
             r["warning_states_streak_once"], r["warning_annotates_longer_streak"],
             r["state_written"], r["session_advanced"],
-            r["idle_streak_advanced"], r["hitter_streak_reset"], r["tracebacks"] == 0,
+            r["idle_streak_advanced"], r["hitter_streak_reset"], r["spoke_chinese"],
+            r["tracebacks"] == 0,
         ])
         return "PASS" if ok else "FAIL"
     if r["refused_cleanly"] and r["tracebacks"] == 0:
@@ -267,7 +280,7 @@ def main() -> int:
     if len(loaded) > 1:
         keys = ["target_lines_hidden", "hitter_hidden", "unrelated_kept", "warning_shown",
                 "warning_after_startup", "warning_names_rule", "warning_states_streak_once",
-                "warning_annotates_longer_streak",
+                "warning_annotates_longer_streak", "spoke_chinese",
                 "state_written", "session_advanced", "idle_streak_advanced",
                 "hitter_streak_reset", "tracebacks"]
         print()

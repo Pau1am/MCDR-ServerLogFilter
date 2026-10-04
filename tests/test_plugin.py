@@ -17,11 +17,15 @@ MCDR is a hard requirement, not an optional extra: the plugin subclasses
 Run:  python -m pytest tests -v
 """
 
+import ast
 import importlib
 import json
+import os
 import pathlib
 import re
 import shutil
+import string
+import subprocess
 import sys
 import tempfile
 import time
@@ -30,11 +34,26 @@ import zipfile
 import pytest
 
 import server_log_filter as slf
+from server_log_filter import i18n
 
 
 # ---------------------------------------------------------------------------
 #  helpers
 # ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def pinned_language(monkeypatch):
+    """Pin the module-level language so message assertions cannot leak across tests.
+
+    The plugin resolves its language once per load and keeps it in a module global, so a
+    test that loads an ``en_us`` config would otherwise change what the *next* test sees —
+    an order-dependent suite. Pinning it to ``zh_cn`` (the language these assertions are
+    written in, and what the plugin printed before it had any language support at all)
+    makes every test independent. The language tests below set it explicitly, or go
+    through ``on_load``, which sets it from the config.
+    """
+    monkeypatch.setattr(slf, "_language", "zh_cn")
+
 
 class RecordingLogger:
     """Captures logger calls so tests can assert on warnings / info messages."""
@@ -86,7 +105,14 @@ class FakeSource:
 
 
 class FakePluginServer:
-    def __init__(self, logger=None, config_data=None, state_data=None, data_folder=None):
+    def __init__(
+        self,
+        logger=None,
+        config_data=None,
+        state_data=None,
+        data_folder=None,
+        mcdr_language="zh_cn",
+    ):
         self.logger = logger or RecordingLogger()
         self.info_filters = []
         self.help_messages = []
@@ -97,6 +123,13 @@ class FakePluginServer:
         self.saved = {}
         self.load_kwargs = {}
         self.data_folder = data_folder
+        # Mirrors ``ServerInterface.get_mcdr_language()``. The default is zh_cn because
+        # that is the language this suite's message assertions are written in; the
+        # language tests override it to prove ``auto`` really follows MCDR.
+        self.mcdr_language = mcdr_language
+
+    def get_mcdr_language(self):
+        return self.mcdr_language
 
     def get_data_folder(self):
         """A throwaway folder by default, so no real config file is ever touched."""
@@ -607,9 +640,17 @@ def test_packager_ships_exactly_the_allowlist(tmp_path):
         "LICENSE",
         "mcdreforged.plugin.json",
         "server_log_filter/__init__.py",
+        "server_log_filter/i18n.py",
+        "server_log_filter/lang/en_us.json",
+        "server_log_filter/lang/zh_cn.json",
     ], names
 
-    for excluded in ("README.md", "README_en.md"):
+    for excluded in (
+        "README.md",
+        "README_en.md",
+        # the translator guide: a README by another name, so it stays out too
+        "server_log_filter/lang/README.md",
+    ):
         assert excluded not in names, "{} must not be shipped".format(excluded)
 
 
@@ -718,9 +759,11 @@ IDLE = "a-rule-that-never-matches"
 LIVE = slf.DEFAULT_PATTERN
 
 
-def start_plugin(config=None, state=None):
+def start_plugin(config=None, state=None, mcdr_language="zh_cn"):
     """Boot the plugin against a fake server and return (server, state_module)."""
-    server = FakePluginServer(config_data=config, state_data=state)
+    server = FakePluginServer(
+        config_data=config, state_data=state, mcdr_language=mcdr_language
+    )
     slf.on_load(server, None)
     return server
 
@@ -1333,7 +1376,8 @@ def test_every_config_option_has_a_description():
     """Coverage invariant for the notes shown when a config gains new options.
 
     Adding an option without recording its version would make the upgrade notice
-    announce a blank entry, so this fails until the option is described.
+    announce a blank entry, so this fails until the option is described — in *every*
+    shipped language, since the sentence itself now comes from the catalogues.
     """
     documented = set(slf.CONFIG_DOC)
     assert config_options() == documented, (
@@ -1341,9 +1385,14 @@ def test_every_config_option_has_a_description():
             config_options() - documented, documented - config_options()
         )
     )
-    for name, (since, desc) in slf.CONFIG_DOC.items():
+    for name, (since, doc_key) in slf.CONFIG_DOC.items():
         assert re.match(r"^\d+\.\d+\.\d+$", since), "{}: bad version {!r}".format(name, since)
-        assert desc.strip(), "{}: empty description".format(name)
+        for language in i18n.available_languages():
+            text = i18n.translate(doc_key, language)
+            assert text != doc_key, "{}: no {} description for {}".format(
+                name, language, doc_key
+            )
+            assert text.strip(), "{}: empty description in {}".format(name, language)
 
 
 def test_the_generated_config_has_no_comment_fields():
@@ -1362,9 +1411,9 @@ def test_migrator_reports_the_options_that_were_missing():
     raw = {"patterns": ["x"]}                      # a 1.0.x era config
     slf._config_migrator(raw)
     assert slf._newly_added_options == [
-        "log_matched_lines", "report_on_server_stop", "warn_about_stale_rules",
-        "stale_rule_threshold", "validate_patterns", "pattern_probe_timeout_ms",
-        "announce_config_upgrade", "announce_broken_config",
+        "language", "log_matched_lines", "report_on_server_stop",
+        "warn_about_stale_rules", "stale_rule_threshold", "validate_patterns",
+        "pattern_probe_timeout_ms", "announce_config_upgrade", "announce_broken_config",
     ]
 
 
@@ -1421,10 +1470,12 @@ def test_upgrade_announcement_explains_each_new_option():
     server = FakePluginServer(config_data={"patterns": [LIVE]})
     slf.on_load(server, None)
     text = announce_output(server)
-    for name, (_, desc) in slf.CONFIG_DOC.items():
+    for name, (_, doc_key) in slf.CONFIG_DOC.items():
         if name in ("patterns", "log_matched_lines", "report_on_server_stop"):
             continue
-        assert desc.split("。")[0] in text, "{}: description missing".format(name)
+        # the sentence shown must be the catalogue's, in the language in force
+        expected = i18n.translate(doc_key, "zh_cn").split("。")[0]
+        assert expected in text, "{}: description missing".format(name)
 
 
 def test_no_announcement_when_the_config_is_already_current():
@@ -1597,9 +1648,9 @@ def test_on_load_checks_the_config_file():
     server = FakePluginServer(config_data={"patterns": [LIVE]})
     original = slf._quarantine_broken_config
 
-    def spy(srv, name):
+    def spy(srv, name, raw=None):
         checked.append(name)
-        return original(srv, name)
+        return original(srv, name, raw)
 
     slf._quarantine_broken_config = spy
     try:
@@ -1614,9 +1665,9 @@ def test_reload_command_checks_the_config_file_too():
     checked = []
     original = slf._quarantine_broken_config
 
-    def spy(srv, name):
+    def spy(srv, name, raw=None):
         checked.append(name)
-        return original(srv, name)
+        return original(srv, name, raw)
 
     slf._quarantine_broken_config = spy
     try:
@@ -1715,3 +1766,400 @@ def test_a_failed_backup_is_reported_even_with_the_notice_off(tmp_path, monkeypa
     slf._quarantine_broken_config(server, slf.CONFIG_FILE_NAME)
 
     assert any("备份" in m for m in server.logger.errors), server.logger.errors
+
+
+# ---------------------------------------------------------------------------
+#  12. language — the plugin speaks the admin's language
+#
+#  Every message lives in server_log_filter/lang/<code>.json; the ``language``
+#  option picks one, defaulting to ``auto`` (follow MCDR). These tests cover the
+#  resolution rules, the wiring into every surface that speaks, and the structural
+#  invariants that keep the catalogues honest.
+# ---------------------------------------------------------------------------
+
+REPO = pathlib.Path(__file__).resolve().parent.parent
+SOURCE_FILES = ["server_log_filter/__init__.py", "server_log_filter/i18n.py"]
+
+
+def catalogue(language):
+    return i18n.get_catalog(language).messages
+
+
+def placeholders(template):
+    """The ``{}`` field names a template uses, e.g. ``{"count"}``."""
+    return {name for _, name, _, _ in string.Formatter().parse(template) if name}
+
+
+def keys_referenced_in_the_code():
+    """Every catalogue key the plugin's own source asks for.
+
+    Parsed rather than grepped: a dotted literal such as ``"state.json"`` inside a
+    docstring is not a message key, and only real call sites should count.
+    """
+    keys = set()
+    for relative in SOURCE_FILES:
+        tree = ast.parse((REPO / relative).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not node.args:
+                continue
+            target = node.func
+            name = getattr(target, "id", None) or getattr(target, "attr", None)
+            if name not in ("_t", "say", "translate"):
+                continue
+            first = node.args[0]
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                keys.add(first.value)
+    keys |= {doc_key for _, doc_key in slf.CONFIG_DOC.values()}
+    # Never a literal at a call site: i18n.resolve() hands it back as a note key.
+    keys.add(i18n.UNSUPPORTED_KEY)
+    return keys
+
+
+def test_the_language_option_is_a_real_option_defaulting_to_auto():
+    assert slf.Config().language == "auto"
+    assert slf.LANGUAGE_OPTION in config_options()
+
+
+def test_auto_follows_mcdr():
+    """The documented default: MCDR says en_us, so the plugin does too."""
+    server = start_plugin(config={"patterns": [LIVE]}, mcdr_language="en_us")
+    assert slf._language == "en_us"
+    assert "Enabled 1 log filter rule" in announce_output(server)
+    assert server.help_messages == [
+        ("!!logfilter", i18n.translate("help.logfilter", "en_us"))
+    ]
+
+
+def test_auto_follows_mcdr_in_the_other_direction():
+    """Stated separately on purpose: a fallback that happens to be en_us would
+    otherwise make ``auto`` look like it works while ignoring MCDR entirely."""
+    server = start_plugin(config={"patterns": [LIVE]}, mcdr_language="zh_cn")
+    assert slf._language == "zh_cn"
+    assert "已启用 1 条日志过滤规则" in announce_output(server)
+
+
+def test_auto_is_silent_about_an_mcdr_language_we_do_not_ship():
+    """``auto`` is a deliberate deferral, so an unsupported MCDR language is not an error.
+
+    The admin never asked for a specific language; nagging them about the one MCDR
+    happens to be set to would be noise on every single load.
+    """
+    server = start_plugin(config={"patterns": [LIVE]}, mcdr_language="ja_jp")
+    assert slf._language == i18n.FALLBACK_LANGUAGE
+    assert server.logger.warnings == [], server.logger.warnings
+
+
+def test_an_explicit_language_overrides_mcdr():
+    server = start_plugin(
+        config={"patterns": [LIVE], "language": "zh_cn"}, mcdr_language="en_us"
+    )
+    assert slf._language == "zh_cn"
+    assert "已启用 1 条日志过滤规则" in announce_output(server)
+
+
+@pytest.mark.parametrize(
+    "written, expected",
+    [
+        ("EN_us", "en_us"),           # case is free
+        ("zh-CN", "zh_cn"),           # a hyphen is as good as an underscore
+        ("  en  ", "en_us"),          # surrounding space, and a bare language code
+        ("zh", "zh_cn"),
+        ("zh_TW", "zh_cn"),           # no zh_tw file: the sibling script is closer
+    ],
+)
+def test_language_codes_are_matched_leniently(written, expected):
+    server = start_plugin(config={"patterns": [LIVE], "language": written})
+    assert slf._language == expected, written
+    assert server.logger.warnings == [], "a value we understood must not be complained about"
+
+
+def test_an_unknown_language_falls_back_and_says_so():
+    server = start_plugin(config={"patterns": [LIVE], "language": "klingon"})
+    assert slf._language == i18n.FALLBACK_LANGUAGE
+    warnings = "\n".join(server.logger.warnings)
+    assert "klingon" in warnings, "the admin must be told their value was ignored"
+    assert "en_us" in warnings and "zh_cn" in warnings, "and what the valid values are"
+
+
+def only_these_catalogues(monkeypatch, files):
+    """Point the catalogue loader at an in-memory set of language files.
+
+    ``files`` maps a language code to the *text* of its catalogue. This substitutes the
+    package-resource loader rather than a directory on disk, which is the code path a
+    packed ``.mcdr`` uses — MCDR imports the plugin straight out of the zip, so the
+    catalogues are read through the loader there, never through ``open()``.
+    """
+
+    def reader(relative):
+        language = relative.rsplit("/", 1)[-1][: -len(".json")]
+        text = files.get(language)
+        return None if text is None else text.encode("utf-8")
+
+    monkeypatch.setattr(i18n, "_resource_bytes", reader)
+    monkeypatch.setattr(
+        i18n, "_list_lang_files", lambda: sorted("{}.json".format(k) for k in files)
+    )
+    i18n.clear_cache()
+
+
+def test_a_broken_catalogue_falls_back_and_is_reported(monkeypatch):
+    """A contributor's broken translation must not break the server.
+
+    ``zh_cn`` is the one that fails, and ``zh_cn`` is what is selected, so every
+    message falls back to the readable ``en_us`` catalogue — and the admin is told
+    which file to fix.
+    """
+    only_these_catalogues(
+        monkeypatch, {"en_us": json.dumps(catalogue("en_us")), "zh_cn": "{ not json"}
+    )
+    try:
+        server = start_plugin(config={"patterns": [LIVE], "language": "zh_cn"})
+        assert slf._language == "zh_cn"
+        warnings = "\n".join(server.logger.warnings)
+        assert "zh_cn.json" in warnings, warnings
+        # messages fall back to the catalogue that does load, rather than showing keys
+        assert "Enabled 1 log filter rule" in announce_output(server)
+    finally:
+        i18n.clear_cache()
+
+
+def test_two_broken_catalogues_still_do_not_break_the_plugin(monkeypatch):
+    """With nothing readable left, the message degrades to its key name.
+
+    That is the deliberate last resort: the key is descriptive on purpose, and it
+    beats both an exception and a blank line.
+    """
+    only_these_catalogues(monkeypatch, {"en_us": "{ not json", "zh_cn": "{ not json"})
+    try:
+        server = start_plugin(config={"patterns": [LIVE], "language": "zh_cn"})
+        assert slf._log_filter is not None, "the plugin still loaded"
+        assert "summary.rules_enabled" in announce_output(server)
+    finally:
+        i18n.clear_cache()
+
+
+def test_the_packed_plugin_can_still_read_its_catalogues(tmp_path):
+    """The failure mode that makes all of this worth pinning.
+
+    MCDR imports a packed plugin **out of the zip**, so ``__file__`` points inside the
+    ``.mcdr`` and anything that opens a file next to it fails. When that happens the
+    plugin still starts and still filters — it just quietly shows raw keys to every
+    user, which no ordinary test would notice. So: build the real artifact, import it
+    through the real loader in a subprocess, and require a real sentence to come out.
+    """
+    pack = importlib.import_module("pack")
+    artifact = tmp_path / "ServerLogFilter.mcdr"
+    pack.build(artifact)
+
+    script = (
+        "import sys\n"
+        "sys.path.insert(0, {path!r})\n"
+        "import server_log_filter as slf\n"
+        "from server_log_filter import i18n\n"
+        "print('loaded from', slf.__file__)\n"
+        "print('languages', i18n.available_languages())\n"
+        "print(i18n.translate('summary.rules_enabled', 'zh_cn', count=2))\n"
+        "print(i18n.translate('summary.rules_enabled', 'en_us', count=2))\n"
+    ).format(path=str(artifact))
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env={**os.environ, "PYTHONPATH": str(REPO / ".testlibs")},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert ".mcdr" in proc.stdout, "the artifact itself must have been imported"
+    assert "['en_us', 'zh_cn']" in proc.stdout, proc.stdout
+    assert "已启用 2 条日志过滤规则" in proc.stdout, proc.stdout
+    assert "Enabled 2 log filter rule(s)" in proc.stdout, proc.stdout
+
+
+def test_the_language_switches_on_reload_without_a_restart():
+    server = start_plugin(config={"patterns": [LIVE], "language": "zh_cn"})
+    assert slf._language == "zh_cn"
+
+    server.config_data = {"patterns": [LIVE], "language": "en_us"}
+    source = FakeSource()
+    slf._reload(source)
+    assert slf._language == "en_us"
+    assert "Filter rules reloaded" in "".join(str(x) for x in source.replies)
+
+
+def test_mcdr_language_is_read_from_the_config_dict_when_the_method_is_absent():
+    """Belt and braces for an MCDR old enough to lack ``get_mcdr_language()``."""
+    server = FakePluginServer(config_data={"patterns": [LIVE]})
+    server.get_mcdr_language = None
+    server.get_mcdr_config = lambda: {"language": "en_us"}
+    slf.on_load(server, None)
+    assert slf._language == "en_us"
+
+
+def test_a_failing_mcdr_language_lookup_does_not_take_the_plugin_down():
+    server = FakePluginServer(config_data={"patterns": [LIVE]})
+
+    def boom():
+        raise RuntimeError("no language for you")
+
+    server.get_mcdr_language = boom
+    server.get_mcdr_config = boom
+    slf.on_load(server, None)
+
+    assert slf._language == i18n.FALLBACK_LANGUAGE
+    assert slf._log_filter is not None, "the plugin still loaded"
+
+
+def test_the_broken_config_notice_uses_the_language_from_the_raw_file(tmp_path):
+    """The file is unparseable, so its own text is the only source for the language.
+
+    MCDR here is zh_cn; the admin's broken file says en_us. Reporting the reset in
+    Chinese would be exactly backwards — that message is the one that has to be read.
+    """
+    text = _broken_config_mentioning('"language": "en_us",')
+    server, _ = server_with_config_file(tmp_path, text)     # MCDR language: zh_cn
+    slf._quarantine_broken_config(server, slf.CONFIG_FILE_NAME)
+
+    assert any("cannot be parsed" in m for m in server.logger.errors), server.logger.errors
+    assert not any("无法解析" in m for m in server.logger.errors)
+
+
+def test_english_reaches_the_stale_rule_warning():
+    server = start_plugin(
+        config={"patterns": [IDLE], "stale_rule_threshold": 1, "language": "en_us"}
+    )
+    run_session(server)
+    slf.on_server_start(server)
+    slf.on_server_startup(server)
+
+    text = warnings_of(server)
+    assert "have matched nothing for 1 or more consecutive sessions" in text
+    assert "!!logfilter test" in text, "the advice has to survive translation"
+
+
+def test_english_reaches_the_commands_and_the_run_summary():
+    server = start_plugin(config={"patterns": [LIVE], "language": "en_us"}, state=None)
+
+    status = FakeSource()
+    slf._show_status(status)
+    assert "Rules:" in "".join(str(x) for x in status.replies)
+
+    hit = FakeSource()
+    slf._test_line(hit, {"text": "Player Steve " + LIVE})
+    assert "would be hidden" in "".join(str(x) for x in hit.replies)
+
+    miss = FakeSource()
+    slf._test_line(miss, {"text": 'Done (0.648s)! For help, type "help"'})
+    assert "would not be hidden" in "".join(str(x) for x in miss.replies)
+
+    reset = FakeSource()
+    slf._reset_streaks(reset)
+    assert "Idle-session counters reset" in "".join(str(x) for x in reset.replies)
+
+    # the end-of-run summary counts what the filter itself saw, so drive real
+    # matches through it rather than poking the counters
+    server.logger.infos.clear()
+    slf.on_server_start(server)
+    for _ in range(7):
+        slf._log_filter.filter_server_info(FakeInfo("Player Steve " + LIVE))
+    slf.on_server_stop(server, 0)
+    assert any(
+        "Hidden 7 server log line(s)" in m for m in server.logger.infos
+    ), server.logger.infos
+
+
+def test_english_reaches_the_prune_announcement_and_the_rule_errors():
+    server = FakePluginServer(
+        config_data={"patterns": [LIVE], "language": "en_us"},
+        state_data={"session_index": 1, "rules": {"a-gone-rule": {}}},
+        mcdr_language="en_us",
+    )
+    slf.on_load(server, None)
+
+    assert any(
+        "Cleared 1 rule statistic(s)" in m for m in server.logger.infos
+    ), server.logger.infos
+
+    bad = FakePluginServer(logger=RecordingLogger(), mcdr_language="en_us")
+    slf._build_rules(bad, ["(unclosed"])
+    assert any("failed to compile" in m for m in bad.logger.warnings), bad.logger.warnings
+
+    slf._language = "en_us"
+    danger = FakePluginServer(logger=RecordingLogger())
+    slf._build_rules(danger, [r"(a+)+$"])
+    assert any(
+        "catastrophic backtracking" in m for m in danger.logger.errors
+    ), danger.logger.errors
+
+
+def test_english_reaches_the_upgrade_notice():
+    server = FakePluginServer(
+        config_data={"patterns": [LIVE], "language": "en_us"}, mcdr_language="en_us"
+    )
+    slf.on_load(server, None)
+
+    text = announce_output(server)
+    assert "Config updated" in text
+    assert "added in v1.1.0" in text
+    assert 'See the "Configuration" section' in text
+
+
+# --- catalogue invariants ---------------------------------------------------
+
+def test_every_shipped_language_file_loads():
+    languages = i18n.available_languages()
+    assert languages, "no language files were found"
+    assert i18n.FALLBACK_LANGUAGE in languages, "the fallback must ship"
+    for language in languages:
+        assert i18n.get_catalog(language).error is None, language
+
+
+def test_every_language_file_has_exactly_the_same_keys():
+    """A language missing a key shows the key name to the user instead of a sentence."""
+    languages = i18n.available_languages()
+    reference = set(catalogue(i18n.FALLBACK_LANGUAGE))
+    assert reference
+    for language in languages:
+        keys = set(catalogue(language))
+        assert keys == reference, "{}: missing {}; unexpected {}".format(
+            language, sorted(reference - keys), sorted(keys - reference)
+        )
+
+
+def test_every_translation_keeps_the_placeholders():
+    """Dropping ``{count}`` turns a sentence into a lie, not just a typo."""
+    reference = catalogue(i18n.FALLBACK_LANGUAGE)
+    for language in i18n.available_languages():
+        translated = catalogue(language)
+        for key, template in reference.items():
+            assert placeholders(translated[key]) == placeholders(template), (
+                "{}: {} lost or gained a placeholder".format(language, key)
+            )
+
+
+def test_every_key_the_code_asks_for_exists_in_every_catalogue():
+    keys = keys_referenced_in_the_code()
+    assert keys, "the extractor found no keys at all -- it is broken, not the code"
+    for language in i18n.available_languages():
+        missing = sorted(k for k in keys if k not in catalogue(language))
+        assert not missing, "{}: {}".format(language, missing)
+
+
+def test_no_catalogue_key_is_left_unused():
+    """Dead keys ship to every user and quietly stop being maintained."""
+    unused = sorted(set(catalogue("en_us")) - keys_referenced_in_the_code())
+    assert not unused, "unused catalogue keys: {}".format(unused)
+
+
+def test_the_config_descriptions_are_exactly_the_options():
+    described = {k for k in catalogue("en_us") if k.startswith("config_doc.")}
+    expected = {"config_doc." + name for name in config_options()}
+    assert described == expected, sorted(described ^ expected)
+
+
+def test_the_english_catalogue_is_actually_english():
+    """Catches a forgotten translation pasted straight back in."""
+    for key, template in catalogue("en_us").items():
+        cjk = [c for c in template if "\u4e00" <= c <= "\u9fff"]
+        assert not cjk, "{} is not translated: {!r}".format(key, template)

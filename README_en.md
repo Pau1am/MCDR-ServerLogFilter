@@ -62,6 +62,7 @@ Running several backends? Put one copy in each — configurations are independen
 
 ```json
 {
+    "language": "auto",
     "patterns": [
         "standing on air - force-sending blocks below"
     ],
@@ -78,6 +79,7 @@ Running several backends? Put one copy in each — configurations are independen
 
 | Key | Type | Default | Description |
 |---|---|---|---|
+| `language` | `string` | `"auto"` | Message language. `auto` follows MCDR's own `language` setting; `zh_cn` / `en_us` pin it — see [Language](#language) |
 | `patterns` | `string[]` | see above | Regex rules. Matched against the **body** of each line (MCDR has already stripped the `[time] [thread/level]:` prefix). A match hides the line |
 | `log_matched_lines` | `bool` | `false` | Debug aid. When `true`, every hidden line is written to the MCDR log at INFO level |
 | `report_on_server_stop` | `bool` | `true` | On server stop, log a summary of how many lines were hidden this run |
@@ -94,6 +96,39 @@ Running several backends? Put one copy in each — configurations are independen
 
 > The config file is JSON, which **has no comment syntax** — each key is explained in the table above.
 
+### Language
+
+Every message a human reads — console notices, log lines, the replies to `!!logfilter` — lives
+in a language file, and `language` picks which one:
+
+| Value | Effect |
+|---|---|
+| `auto` *(default)* | **Follow MCDR's current language** (the `language` key in MCDR's `config.yml`) — set MCDR to Chinese and the plugin speaks Chinese, with nothing to configure |
+| `zh_cn` | Simplified Chinese, whatever MCDR is set to |
+| `en_us` | English, whatever MCDR is set to |
+
+- Case and `-` / `_` are free: `zh-CN`, `EN_us` and `en` are all understood.
+- A language with no file falls back to `en_us` and says so once in the log — silently
+  switching language is harder to debug than a warning.
+- MCDR set to `zh_tw` with no Traditional Chinese file yet resolves to `zh_cn`, matching
+  MCDR's own fallback order.
+- When the config file is broken, this value can only be read from **your own file text**
+  (the config has already failed to parse), so it works even if it sits after the syntax
+  error — the "your config was reset" notice is written in the language it names.
+- Save the file and run `!!logfilter reload`; no restart needed.
+
+> **`auto` reads MCDR's *current* `language` setting from `config.yml` — it is not a
+> built-in default.** Set MCDR to `zh_cn` and the plugin speaks Chinese with no
+> configuration at all. The flip side: only if you have **never changed** MCDR's language
+> (MCDR ships with `en_us`) will the notices turn English after upgrading to 1.2.2 — set
+> `language` to `zh_cn` if you would rather keep the Chinese ones.
+
+**Want to add a language?** Copy `en_us.json`, rename it to `<code>.json`
+(`ja_jp.json`, `zh_tw.json`, …), translate the *values*, run `pytest tests -k language`,
+and open a pull request — **no code changes needed**. The files live in
+`server_log_filter/lang/`, and the `README.md` next to them is written for translators.
+`en_us` is the fallback catalogue, so please keep it complete.
+
 ### Upgrades fill in new options, and say so
 
 After a plugin update, options missing from your config are **filled in from their defaults**
@@ -102,11 +137,11 @@ plugin now reports it in the log:
 
 ```
 ==================================================================
-[ServerLogFilter] 配置已更新：本次新增了 4 个配置项，已按默认值写入
-  · warn_about_stale_rules  （v1.1.0 加入）
+[ServerLogFilter] Config updated: 4 new option(s) were added and written with their default values
+  - warn_about_stale_rules  (added in v1.1.0)
       ...
-  配置文件：config/server_log_filter/config.json
-  Each option is described in the table above.
+  Config file: config/server_log_filter/config.json
+  See the "Configuration" section of the README for what each one does.
 ==================================================================
 ```
 
@@ -127,11 +162,14 @@ The plugin checks the file itself before handing it to MCDR. When something is w
 
 ```
 ==================================================================
-[ServerLogFilter] 配置文件无法解析，已重置为默认配置
-  · 出问题的文件：config/server_log_filter/config.json
-  · 原文件已备份为：config/server_log_filter/config.json.old
-  · 具体原因：JSON 语法错误：Expecting ',' delimiter: line 4 column 9 (char 83)
-  ...
+[ServerLogFilter] The config file cannot be parsed; it has been reset to the default config
+  - The file at fault: config/server_log_filter/config.json
+  - Your original file was saved as: config/server_log_filter/config.json.old
+  - What went wrong: JSON syntax error: Expecting ',' delimiter: line 4 column 9 (char 83)
+  - A new config.json was generated with the default values. Fix the content against your backup and put it back,
+    or run !!logfilter reload once you have fixed it.
+  Usual cause: every element of the patterns array needs a comma "," between them,
+              and there must be no trailing comma after the last one.
 ==================================================================
 ```
 
@@ -158,15 +196,22 @@ after the server finishes starting (i.e. after the `Done` line):
 
 ```
 ==================================================================
-[ServerLogFilter] 注意：有 2 条过滤规则连续 3 次及以上开服都没有命中
+[ServerLogFilter] Heads up: 2 filter rule(s) have matched nothing for 3 or more consecutive sessions
   · standing on air - force-sending blocks below
-  · test12345
-  ...
+  · test12345   (idle for 9 sessions)
+  There are usually only two explanations:
+    1. The regex is wrong (spelling / case / escaping, or it does not match this server version)
+    2. The log line it targets is no longer produced (e.g. the upstream bug was fixed)
+  Advice: use !!logfilter test <a log line> to check whether the rule still matches;
+          if it is useless, delete that entry from patterns,
+          if it is simply rare, raise stale_rule_threshold,
+          or use !!logfilter reset to clear the counters and start observing again.
+  (The reminder itself costs no performance -- it is only there to keep the config clean.)
 ==================================================================
 ```
 
 The count lives in the header only; each rule is listed once. A rule idle **longer than the
-threshold** gets a short `（已连续 9 次零命中）` note — that part is not in the header.
+threshold** gets a short `(idle for 9 sessions)` note — that part is not in the header.
 
 Worth knowing:
 
@@ -193,7 +238,7 @@ plugin tries every rule against a few very short probe strings and refuses the d
 with a clear error:
 
 ```
-[ServerLogFilter] 过滤规则存在灾难性回溯风险，已跳过: '(a+)+$' —— 在 22 字符的探测串上已耗时 90 ms（上限 25 ms）。
+[ServerLogFilter] Filter rule risks catastrophic backtracking, skipped: '(a+)+$' -- took 90 ms on a 22-character probe string (budget 25 ms). This rule would stall MCDR's main thread on nearly every line; rewrite it as a plain substring or drop the nested quantifier and try again.
 ```
 
 The check runs once at load; realistic patterns cost microseconds, and a refused rule never

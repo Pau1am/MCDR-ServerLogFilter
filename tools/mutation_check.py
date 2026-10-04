@@ -13,6 +13,7 @@ Run from the repository root::
 Needs the ``.testlibs`` setup (see tests/README.md).
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -22,6 +23,9 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SRC = "server_log_filter/__init__.py"
+I18N = "server_log_filter/i18n.py"
+LANG_ZH = "server_log_filter/lang/zh_cn.json"
+LANG_EN = "server_log_filter/lang/en_us.json"
 
 WARN_BLOCK = """    if (
         not _config.warn_about_stale_rules
@@ -119,7 +123,7 @@ def drop_config_descriptions(src):
 
 
 QUARANTINE_CALL = (
-    "    _config_was_reset = _quarantine_broken_config(server, CONFIG_FILE_NAME) is not None\n"
+    "    _config_was_reset = _quarantine_broken_config(server, CONFIG_FILE_NAME, raw) is not None\n"
 )
 
 DOC_SUFFIX_LINE = '            suffix = "   （已连续 {} 次零命中）".format(entry.zero_streak)\n'
@@ -200,46 +204,136 @@ def ignore_the_reset_guard(src):
     """配置刚被自动重置（写坏）时也照常清理 —— 会顺手抹掉用户还在的历史。"""
     return src.replace(RESET_GUARD, "    if False:  # mutation: reset guard ignored\n")
 
+
+# --- language ---------------------------------------------------------------
+#
+# These exist because this feature has a nasty failure mode: getting it wrong does not
+# crash anything, it just quietly stops talking to the user. Two of them mutate a
+# language file rather than Python, which is why every entry below names its target.
+
+LANGUAGE_ASSIGN = "    _language = _resolve_language(server, setting)\n"
+MCDR_LOOKUP = "    choice = i18n.resolve(setting, _mcdr_language(server))\n"
+NOTE_GUARD = "    if choice.note_key is not None and warn:\n"
+CATALOG_GUARD = "    if problem is not None and warn:\n"
+QUARANTINE_LANGUAGE = (
+    "        server, _raw_str_option(raw, LANGUAGE_OPTION) or i18n.AUTO, warn=False\n"
+)
+LOADER_READ = (
+    "    try:\n"
+    "        data = pkgutil.get_data(__package__, relative)\n"
+    "    except (OSError, ImportError, ValueError):\n"
+    "        data = None\n"
+)
+
+
+def ignore_the_language_option(src):
+    """无视配置里的 language —— 一律用回落语言说话。"""
+    return src.replace(
+        LANGUAGE_ASSIGN, "    _language = i18n.FALLBACK_LANGUAGE  # mutation\n"
+    )
+
+
+def ignore_the_mcdr_language(src):
+    """auto 不再跟随 MCDR，直接落回默认语言。"""
+    return src.replace(MCDR_LOOKUP, "    choice = i18n.resolve(setting, None)  # mutation\n")
+
+
+def skip_the_catalogues(src):
+    """不再经过加载器读语言文件 —— 打包成 .mcdr 后整包就只剩裸键名。"""
+    return src.replace(LOADER_READ, "    data = None  # mutation: bypass the loader\n")
+
+
+def silence_the_unknown_language_warning(src):
+    """认不出的 language 取值被静默吞掉（用户会以为设置生效了）。"""
+    return src.replace(NOTE_GUARD, "    if False:  # mutation\n", 1)
+
+
+def silence_the_unreadable_catalogue_warning(src):
+    """语言文件坏掉也不吭声。"""
+    return src.replace(CATALOG_GUARD, "    if False:  # mutation\n", 1)
+
+
+def ignore_the_language_in_a_broken_config(src):
+    """写坏的配置里写的语言不再被读到 —— 播报会莫名其妙换一种语言。"""
+    return src.replace(
+        QUARANTINE_LANGUAGE, "        server, i18n.AUTO, warn=False,  # mutation\n"
+    )
+
+
+def drop_a_translation(src):
+    """某个语言少了一条消息（用户会看到裸键名）。适用于语言文件而非 Python。"""
+    data = json.loads(src)
+    data.pop("status.tip", None)
+    return json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+
+
+def drop_a_placeholder(src):
+    """译文里漏掉 {count} —— 句子不再只是难看，而是说谎。"""
+    data = json.loads(src)
+    data["summary.rules_enabled"] = data["summary.rules_enabled"].replace("{count}", "")
+    return json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+
+
+# (名称, 被改的文件, 改法, pytest 选择器)
 MUTATIONS = [
-    ("idle-rule warning disabled", disable_warning,
-     ["tests/test_plugin.py", "-k", "idle or stale or streak"]),    ("threshold changed from >= to >", threshold_off_by_one,
+    ("idle-rule warning disabled", SRC, disable_warning,
+     ["tests/test_plugin.py", "-k", "idle or stale or streak"]),
+    ("threshold changed from >= to >", SRC, threshold_off_by_one,
      ["tests/test_plugin.py", "-k", "threshold or idle_rule"]),
-    ("'session finished starting' guard removed", drop_startup_guard,
+    ("'session finished starting' guard removed", SRC, drop_startup_guard,
      ["tests/test_plugin.py", "-k", "never_reached_startup"]),
-    ("reload counter carry-over broken", break_carry_over,
+    ("reload counter carry-over broken", SRC, break_carry_over,
      ["tests/test_plugin.py", "-k", "reload_does_not_fake"]),
-    ("running-session flag lost on reload", drop_session_flag_carry_over,
+    ("running-session flag lost on reload", SRC, drop_session_flag_carry_over,
      ["tests/test_plugin.py", "-k", "reload_carries_the_running_session"]),
-    ("catastrophic-backtracking probe disabled", disable_probe,
+    ("catastrophic-backtracking probe disabled", SRC, disable_probe,
      ["tests/test_plugin.py", "-k", "catastrophic or applies_the_probe or validate_patterns"]),
-    ("warning moved before the Done line", warn_before_startup,
+    ("warning moved before the Done line", SRC, warn_before_startup,
      ["tests/test_e2e.py", "-k", "arrives_after"]),
-    ("a non-option key injected into the config", inject_a_key_into_the_config,
+    ("a non-option key injected into the config", SRC, inject_a_key_into_the_config,
      ["tests/test_plugin.py", "-k", "no_comment_fields or generated_config_contains_only"]),
-    ("an option lost its description", drop_config_descriptions,
+    ("an option lost its description", SRC, drop_config_descriptions,
      ["tests/test_plugin.py", "-k", "has_a_description"]),
-    ("upgrade announcement silenced", silence_upgrade_announcement,
+    ("upgrade announcement silenced", SRC, silence_upgrade_announcement,
      ["tests/test_plugin.py", "-k", "announcement or announcement_lists"]),
-    ("the upgrade switch ignored", ignore_the_upgrade_switch,
+    ("the upgrade switch ignored", SRC, ignore_the_upgrade_switch,
      ["tests/test_plugin.py", "-k", "switch"]),
-    ("the broken-config switch ignored", ignore_the_broken_config_switch,
+    ("the broken-config switch ignored", SRC, ignore_the_broken_config_switch,
      ["tests/test_plugin.py", "-k", "switch or leniently"]),
-    ("broken config no longer quarantined", drop_quarantine_call,
+    ("broken config no longer quarantined", SRC, drop_quarantine_call,
      ["tests/test_plugin.py", "-k", "broken_config or quarantine or on_load_checks"]),
-    ("problem detected but file not backed up", drop_backup_move,
+    ("problem detected but file not backed up", SRC, drop_backup_move,
      ["tests/test_plugin.py", "-k", "backed_up_before"]),
-    ("streak repeated for every rule again", repeat_streak_for_every_rule,
+    ("streak repeated for every rule again", SRC, repeat_streak_for_every_rule,
      ["tests/test_plugin.py", "-k", "no_annotation or does_not_repeat"]),
-    ("config reset not announced", silence_reset_announcement,
+    ("config reset not announced", SRC, silence_reset_announcement,
      ["tests/test_plugin.py", "-k", "announcement_says_what_where_and_why"]),
-    ("no pruning of deleted rules on plugin load", drop_prune_on_load,
+    ("no pruning of deleted rules on plugin load", SRC, drop_prune_on_load,
      ["tests/test_plugin.py", "-k", "prunes_its_state_immediately or announces_what_it_removed"]),
-    ("no pruning of deleted rules on !!logfilter reload", drop_prune_on_reload_command,
+    ("no pruning of deleted rules on !!logfilter reload", SRC, drop_prune_on_reload_command,
      ["tests/test_plugin.py", "-k", "prunes_its_state_on_the_reload_command"]),
-    ("orphans judged against the compiled rules", prune_against_compiled_rules,
+    ("orphans judged against the compiled rules", SRC, prune_against_compiled_rules,
      ["tests/test_plugin.py", "-k", "rejected_by_the_safety_probe"]),
-    ("history wiped when the config was auto-reset", ignore_the_reset_guard,
+    ("history wiped when the config was auto-reset", SRC, ignore_the_reset_guard,
      ["tests/test_plugin.py", "-k", "reset_config_does_not_wipe"]),
+    ("the language option ignored", SRC, ignore_the_language_option,
+     ["tests/test_plugin.py", "-k",
+      "explicit_language_overrides or leniently or switches_on_reload"]),
+    ("auto no longer follows MCDR", SRC, ignore_the_mcdr_language,
+     ["tests/test_plugin.py", "-k", "auto_follows_mcdr or idle or threshold"]),
+    ("catalogues read from the filesystem, not the loader", I18N, skip_the_catalogues,
+     ["tests/test_plugin.py", "-k", "packed_plugin_can_still_read"]),
+    ("an unrecognised language value not reported", SRC, silence_the_unknown_language_warning,
+     ["tests/test_plugin.py", "-k", "unknown_language"]),
+    ("an unreadable catalogue not reported", SRC, silence_the_unreadable_catalogue_warning,
+     ["tests/test_plugin.py", "-k", "broken_catalogue_falls_back"]),
+    ("a broken config's language not read from its own text", SRC,
+     ignore_the_language_in_a_broken_config,
+     ["tests/test_plugin.py", "-k", "broken_config_notice_uses_the_language"]),
+    ("a message missing from one translation", LANG_ZH, drop_a_translation,
+     ["tests/test_plugin.py", "-k", "same_keys"]),
+    ("a placeholder dropped from a translation", LANG_ZH, drop_a_placeholder,
+     ["tests/test_plugin.py", "-k", "keeps_the_placeholders"]),
 ]
 
 def pytest_ok(workdir, selector):
@@ -265,7 +359,12 @@ def main():
     shutil.copytree(REPO, workdir / "repo",
                     ignore=shutil.ignore_patterns(".git", ".pytest_cache"))
     repo = workdir / "repo"
-    baseline = (repo / SRC).read_text(encoding="utf-8")
+    # One pristine copy per file a mutation touches, so a mutation can be undone
+    # without rebuilding the tree.
+    baselines = {
+        relative: (repo / relative).read_text(encoding="utf-8")
+        for _, relative, _, _ in MUTATIONS
+    }
 
     code, summary = pytest_ok(repo, ["tests/test_plugin.py", "-k",
                                      "stale or idle or threshold or reload_does_not_fake or "
@@ -273,7 +372,8 @@ def main():
                                      "no_comment_fields or has_a_description or "
                                      "generated_config_contains_only or prun or "
                                      "rejected_by_the_safety_probe or switch or "
-                                     "leniently or raw_bool"])
+                                     "leniently or raw_bool or language or english or "
+                                     "auto or catalogue or translation or packed_plugin"])
     print("baseline (unmutated): exit={} {}".format(code, summary))
     if code != 0:
         print("baseline is not green — fix the tests first")
@@ -281,22 +381,23 @@ def main():
     print()
 
     killed = 0
-    for name, mutate, selector in MUTATIONS:
+    for name, relative, mutate, selector in MUTATIONS:
+        baseline = baselines[relative]
         mutated = mutate(baseline)
         if mutated == baseline:
             print("  !! {}: mutation did not apply (anchor moved?)".format(name))
             continue
-        (repo / SRC).write_text(mutated, encoding="utf-8")
+        (repo / relative).write_text(mutated, encoding="utf-8")
         code, summary = pytest_ok(repo, selector)
-        (repo / SRC).write_text(baseline, encoding="utf-8")
+        (repo / relative).write_text(baseline, encoding="utf-8")
 
         if code == 1:
-            print("  caught   {:<42} {}".format(name, summary))
+            print("  caught   {:<52} {}".format(name, summary))
             killed += 1
         elif code in (4, 5):
-            print("  HARNESS  {:<42} exit={} — selector matched nothing".format(name, code))
+            print("  HARNESS  {:<52} exit={} — selector matched nothing".format(name, code))
         else:
-            print("  SURVIVED {:<42} exit={} {}".format(name, code, summary))
+            print("  SURVIVED {:<52} exit={} {}".format(name, code, summary))
 
     print()
     print("caught {}/{}".format(killed, len(MUTATIONS)))

@@ -16,11 +16,13 @@ Only these are shipped:
 
 * ``mcdreforged.plugin.json`` — package metadata (required)
 * ``server_log_filter/**.py`` — the plugin code, recursively (submodules included)
+* ``server_log_filter/lang/*.json`` — the message catalogues (one file per language)
 * ``LICENSE``, ``CHANGELOG.md`` — licence text and the shipped changelog
 
 ``README.md`` / ``README_en.md`` are deliberately **excluded**: they are long, they
 duplicate what the release page already says, and MCDR never reads them. Keeping
-them out cuts roughly half off the artifact.
+them out cuts roughly half off the artifact. ``server_log_filter/lang/README.md``
+— the contributor guide for translators — is excluded for the same reason.
 
 ``pack.py`` itself is intentionally **not** included, for the same root-module reason.
 """
@@ -45,6 +47,29 @@ ROOT_FILES = {
 # Code package: same name as the plugin id.
 PACKAGE_NAME = "server_log_filter"
 
+# Data inside the package that ships alongside the code. The message catalogues must
+# travel with the plugin — without them every message degrades to its raw key — and
+# keeping them as separate .json files is what lets a translator add a language
+# without touching Python.
+PACKAGE_DATA_DIRS = {
+    "lang": (".json",),
+}
+
+
+def _is_package_payload(rel: Path) -> bool:
+    """True for files inside the plugin package that belong in the artifact."""
+    if rel.parts[0] != PACKAGE_NAME:
+        return False
+    if rel.suffix == ".py":
+        # Every module, at any depth: a silently dropped submodule would produce an
+        # artifact that imports fine here and explodes on the user's machine.
+        return True
+    # A data directory such as ``lang/``: only the extensions we asked for, and only
+    # directly inside it. ``lang/README.md`` (the translator guide) stays out.
+    if len(rel.parts) == 3 and rel.parts[1] in PACKAGE_DATA_DIRS:
+        return rel.suffix in PACKAGE_DATA_DIRS[rel.parts[1]]
+    return False
+
 
 def plugin_version() -> str:
     with open(SRC / "mcdreforged.plugin.json", encoding="utf-8") as fh:
@@ -64,10 +89,11 @@ def collect() -> list:
         rel = path.relative_to(SRC)
         if rel.parent == Path(".") and rel.name in ROOT_FILES:
             files.append(path)
-        elif rel.parts and rel.parts[0] == PACKAGE_NAME and rel.suffix == ".py":
-            # Recursive: ``rel.parts[0]`` (not ``rel.parent``) so that submodules
-            # such as ``server_log_filter/sub/helper.py`` are shipped too. Using
-            # ``rel.parent`` would silently drop them and produce a broken release.
+        elif rel.parts and _is_package_payload(rel):
+            # Recursive by design: checking ``rel.parts[0]`` (not ``rel.parent``) is what
+            # lets ``server_log_filter/sub/helper.py`` and ``server_log_filter/lang/x.json``
+            # ship too. Using ``rel.parent`` would silently drop them and produce a
+            # broken release.
             files.append(path)
     return sorted(files)
 
