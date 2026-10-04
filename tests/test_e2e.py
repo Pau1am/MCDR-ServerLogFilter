@@ -122,8 +122,17 @@ def _require_mcdr() -> None:
         pytest.skip("mcdreforged is not importable by " + sys.executable)
 
 
-def _build_instance(root: Path, plugin_config: dict = None, state: dict = None) -> Path:
-    """Create an MCDR instance in ``root`` that loads the packaged plugin."""
+def _build_instance(
+    root: Path,
+    plugin_config: dict = None,
+    state: dict = None,
+    raw_plugin_config: str = None,
+) -> Path:
+    """Create an MCDR instance in ``root`` that loads the packaged plugin.
+
+    ``raw_plugin_config`` writes the file verbatim instead of json-dumping a dict —
+    the only way to produce a deliberately malformed config.
+    """
     (root / "server").mkdir(parents=True)
     (root / "plugins").mkdir()
     (root / "logs").mkdir()
@@ -144,15 +153,19 @@ def _build_instance(root: Path, plugin_config: dict = None, state: dict = None) 
     # what gives the end-to-end run the power to tell hidden() and discarded()
     # apart: the line leaves the console either way, but only hidden() keeps
     # dispatching it — and therefore keeps firing SERVER_STARTUP.
-    cfg = {
-        "patterns": [TARGET, CANARY_PATTERN],
-        "log_matched_lines": False,
-        "report_on_server_stop": True,
-    }
-    if plugin_config:
-        cfg.update(plugin_config)
+    if raw_plugin_config is not None:
+        config_text = raw_plugin_config
+    else:
+        cfg = {
+            "patterns": [TARGET, CANARY_PATTERN],
+            "log_matched_lines": False,
+            "report_on_server_stop": True,
+        }
+        if plugin_config:
+            cfg.update(plugin_config)
+        config_text = json.dumps(cfg, indent=2)
     (root / "config" / "server_log_filter" / "config.json").write_text(
-        json.dumps(cfg, indent=2), encoding="utf-8"
+        config_text, encoding="utf-8"
     )
 
     if state is not None:
@@ -309,7 +322,13 @@ def test_packaged_plugin_is_what_was_loaded(e2e_output):
     assert not (root / "plugins" / "server_log_filter").exists()
 
 
-def test_plugin_generated_its_default_config(e2e_output):
+def test_legacy_config_is_upgraded_in_place(e2e_output):
+    """A config file written by an older version gains the new options.
+
+    ``_build_instance`` seeds only the three options that existed in 1.0.x, so this
+    run exercises the real upgrade path: MCDR fills in the missing options from
+    their defaults and writes the file back, and the plugin says so in the log.
+    """
     _, root = e2e_output
     cfg = root / "config" / "server_log_filter" / "config.json"
     assert cfg.is_file(), "plugin did not create its config file"
@@ -324,8 +343,49 @@ def test_plugin_generated_its_default_config(e2e_output):
         "validate_patterns",
         "pattern_probe_timeout_ms",
     }
+
+    # the user's own values survived the migration untouched
     assert TARGET in data["patterns"]
     assert CANARY_PATTERN in data["patterns"]
+    assert data["log_matched_lines"] is False
+
+
+def test_the_generated_config_contains_only_real_options(e2e_output):
+    """No bookkeeping keys in the file the user edits.
+
+    An earlier revision injected ``#option`` fields to imitate JSON comments; the
+    file ended up looking complicated, so it was dropped. This pins the plain shape.
+    """
+    _, root = e2e_output
+    data = json.loads(
+        (root / "config" / "server_log_filter" / "config.json").read_text(encoding="utf-8")
+    )
+    assert not [k for k in data if k.startswith("#")], data
+    for key in data:
+        assert key in slf_config_options(), "unexpected key: {}".format(key)
+
+
+def slf_config_options():
+    """The option names, taken from the shipped Config class."""
+    sys.path.insert(0, str(REPO))
+    import server_log_filter
+
+    return set(server_log_filter.Config.get_field_annotations())
+
+
+def test_upgrade_is_announced_with_versions(e2e_output):
+    """Adding options silently would leave admins unaware their config changed."""
+    output, _ = e2e_output
+    assert "配置已更新" in output, "the upgrade was not announced"
+
+    for name, since in (
+        ("warn_about_stale_rules", "1.1.0"),
+        ("stale_rule_threshold", "1.1.0"),
+        ("validate_patterns", "1.1.0"),
+        ("pattern_probe_timeout_ms", "1.1.0"),
+    ):
+        assert name in output, "new option {} was not listed".format(name)
+    assert "v1.1.0 加入" in output
 
 
 def test_plugin_keeps_its_state_file_out_of_the_user_config(e2e_output):
@@ -415,10 +475,18 @@ def test_stale_rule_warning_arrives_after_the_server_finished_starting(stale_e2e
 def test_stale_rule_warning_is_specific_and_actionable(stale_e2e_output):
     output, _ = stale_e2e_output
     assert "连续 {} 次及以上开服都没有命中".format(STALE_THRESHOLD) in output  # threshold honoured
-    assert "已连续 5 次开服零命中" in output          # the real streak, not just the threshold
-    assert "从未命中过" in output                      # no history of ever matching
+    assert "有 1 条过滤规则连续" in output             # count of idle rules
     assert "!!logfilter test" in output                # tells the admin how to check
     assert "!!logfilter reset" in output               # and how to silence it
+    # the seeded streak (5) is longer than the threshold (2), so it IS worth stating
+    assert "（已连续 5 次零命中）" in output
+
+
+def test_stale_rule_warning_does_not_repeat_itself(stale_e2e_output):
+    """Nothing is said twice — the streak lives in the header, not per rule."""
+    output, _ = stale_e2e_output
+    assert output.count("都没有命中") == 1, "the header must appear exactly once"
+    assert "从未命中过" not in output
 
 
 def test_only_the_idle_rule_is_flagged(stale_e2e_output):
@@ -443,3 +511,64 @@ def test_state_file_advances_by_one_session(stale_e2e_output):
     # the rule that did match is recorded with a fresh (zero) streak
     assert state["rules"][TARGET]["zero_streak"] == 0
     assert state["rules"][TARGET]["hits_last_session"] == 2
+
+
+# ---------------------------------------------------------------------------
+#  a malformed config: preserved, regenerated, and announced
+# ---------------------------------------------------------------------------
+
+# The mistake this guards against: hand-adding a rule to the array and dropping
+# the comma. MCDR's "regen" policy would then replace the whole file with defaults.
+BROKEN_CONFIG = """{
+    "patterns": [
+        "standing on air - force-sending blocks below"
+        "my-own-handwritten-rule"
+    ],
+    "report_on_server_stop": true
+}
+"""
+
+
+@pytest.fixture(scope="module")
+def broken_config_e2e_output(tmp_path_factory):
+    """One MCDR run started with an unparseable config.json."""
+    _require_mcdr()
+    root = tmp_path_factory.mktemp("mcdr_e2e_broken")
+    _build_instance(root, raw_plugin_config=BROKEN_CONFIG)
+    return run_mcdr(root), root
+
+
+def test_broken_config_is_preserved_as_dot_old(broken_config_e2e_output):
+    """The user's own text must survive somewhere they can read it."""
+    _, root = broken_config_e2e_output
+    backup = root / "config" / "server_log_filter" / "config.json.old"
+    assert backup.is_file(), "the broken file was not preserved"
+    assert backup.read_text(encoding="utf-8") == BROKEN_CONFIG
+
+
+def test_broken_config_is_replaced_by_a_valid_one(broken_config_e2e_output):
+    _, root = broken_config_e2e_output
+    cfg = root / "config" / "server_log_filter" / "config.json"
+    data = json.loads(cfg.read_text(encoding="utf-8"))   # parses => regenerated
+    assert TARGET in data["patterns"]
+    assert not [k for k in data if k.startswith("#")], "no bookkeeping keys in the config"
+
+
+def test_reset_is_announced_with_the_reason_and_the_backup_path(broken_config_e2e_output):
+    output, _ = broken_config_e2e_output
+    assert "配置文件无法解析" in output
+    assert "已重置为默认配置" in output
+    assert "config.json.old" in output, "the admin must be told where the old file went"
+    # the JSON parser's own message names the line and column, which is the
+    # actionable part: it points straight at the missing comma
+    assert "line" in output and "column" in output
+    assert "逗号" in output
+
+
+def test_plugin_still_works_after_a_config_reset(broken_config_e2e_output):
+    """A bad config must not take the plugin down with it."""
+    output, root = broken_config_e2e_output
+    assert "已启用 1 条日志过滤规则" in output, "it should fall back to the default rule"
+    echoed = echoed_server_lines(output)
+    assert [l for l in echoed if TARGET in l] == [], "filtering stopped working"
+    assert (root / "startup_event_fired").is_file(), "lifecycle events broke"

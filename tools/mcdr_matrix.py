@@ -189,7 +189,12 @@ def run_one(python: str, plugin: Path, workdir: Path) -> dict:
         "warning_shown": warn_at != -1,
         "warning_after_startup": (done_at != -1 and warn_at != -1 and warn_at > done_at),
         "warning_names_rule": IDLE in out,
-        "warning_says_never_matched": "从未命中过" in out,
+        # The idle streak lives in the header, not per rule. The seeded streak (5)
+        # exceeds the threshold (2), so this rule does get the short annotation.
+        "warning_states_streak_once": out.count("都没有命中") == 1,
+        "warning_annotates_longer_streak": "（已连续 {} 次零命中）".format(
+            SEEDED_SESSION
+        ) in out,
         "state_written": bool(state.get("session_index")),
         "session_advanced": state.get("session_index") == SEEDED_SESSION + 1,
         "idle_streak_advanced": rules.get(IDLE, {}).get("zero_streak") == SEEDED_SESSION + 1,
@@ -204,7 +209,8 @@ def verdict(r: dict) -> str:
         ok = all([
             r["target_lines_hidden"], r["hitter_hidden"], r["unrelated_kept"],
             r["warning_shown"], r["warning_after_startup"], r["warning_names_rule"],
-            r["warning_says_never_matched"], r["state_written"], r["session_advanced"],
+            r["warning_states_streak_once"], r["warning_annotates_longer_streak"],
+            r["state_written"], r["session_advanced"],
             r["idle_streak_advanced"], r["hitter_streak_reset"], r["tracebacks"] == 0,
         ])
         return "PASS" if ok else "FAIL"
@@ -258,7 +264,8 @@ def main() -> int:
 
     if len(loaded) > 1:
         keys = ["target_lines_hidden", "hitter_hidden", "unrelated_kept", "warning_shown",
-                "warning_after_startup", "warning_names_rule", "warning_says_never_matched",
+                "warning_after_startup", "warning_names_rule", "warning_states_streak_once",
+                "warning_annotates_longer_streak",
                 "state_written", "session_advanced", "idle_streak_advanced",
                 "hitter_streak_reset", "tracebacks"]
         print()
