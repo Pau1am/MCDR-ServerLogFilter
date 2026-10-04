@@ -379,7 +379,7 @@ _session_reached_startup = False
 _newly_added_options: List[str] = []
 
 # 本次加载时配置文件是否因为写坏而被自动重置过。重置后 patterns 是默认值而非用户
-# 真实配置，据此清理 state.json 会误删用户的历史统计，所以 _prune_state 会跳过。
+# 真实配置，据此清理 state.json 会误删用户的历史统计，所以 _forget_orphans 会跳过。
 _config_was_reset = False
 
 
