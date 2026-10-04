@@ -170,6 +170,10 @@ JSON 对格式很严格，手工往 `patterns` 里加规则时**漏掉一个逗�
   这个功能的作用是**保持配置干净**，不是提速。
 - 统计结果存在 `config/server_log_filter/state.json`，与你自己写的 `config.json` 分开，
   不会被插件改动。
+- **删掉某条规则后，它在 `state.json` 里的统计会立刻清掉**：改完配置执行
+  `!!logfilter reload`（或 `!!MCDR reload plugin server_log_filter`）即可，
+  不必等下一次开服 / 关服。插件会在日志里列出清掉了哪些规则。
+  仍在配置里、只是暂时没命中的规则不受影响——只有**从 `patterns` 里真正删除**的规则才会被忘掉。
 - 如果某条规则本来就命中得很少（比如一个月才触发一次），把 `stale_rule_threshold` 调大，
   或者用 `!!logfilter reset` 清空计数重新观察。
 - 提醒只在**完成过启动**的周期上统计。服务端启动失败（比如 mod 报错）不会把规则刷成零命中。
@@ -193,7 +197,7 @@ JSON 对格式很严格，手工往 `patterns` 里加规则时**漏掉一个逗�
 | `!!logfilter` | user | 查看状态：规则数、各规则命中次数、连续零命中次数 |
 | `!!logfilter list` | user | 同上 |
 | `!!logfilter test <文本>` | user | 测试某行是否会被隐去，并指出命中哪条规则 |
-| `!!logfilter reload` | admin | 重读配置文件并立即生效，无需重启 |
+| `!!logfilter reload` | admin | 重读配置文件并立即生效，无需重启；同时清除已从配置删除的规则的统计 |
 | `!!logfilter reset` | admin | 清空「连续零命中」计数，重新开始观察 |
 
 `!!logfilter test` 特别实用：把日志原文粘进去就能确认规则对不对，不用真等它触发。

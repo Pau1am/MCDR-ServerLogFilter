@@ -164,6 +164,12 @@ Worth knowing:
   per-line filtering path gains no extra work. Its purpose is keeping the config honest.
 - The history lives in `config/server_log_filter/state.json`, separate from the `config.json`
   you edit. The plugin never touches your config.
+- **Delete a rule and its history goes with it.** After editing `patterns`, run
+  `!!logfilter reload` (or `!!MCDR reload plugin server_log_filter`) and the statistics for
+  the rules you removed are cleared straight away — no need to wait for the next
+  start/stop cycle. The plugin logs exactly which rules it forgot. Rules that are still in
+  `patterns` but simply have not matched yet are untouched: only rules **actually removed
+  from the config** are forgotten.
 - If a rule is legitimately rare (fires once a month, say), raise `stale_rule_threshold`, or
   use `!!logfilter reset` to clear the counters and start observing again.
 - Only sessions that actually **finished starting** are counted, so a server that fails to boot
@@ -190,7 +196,7 @@ affects the others. Leave `validate_patterns` on unless you know exactly what yo
 | `!!logfilter` | user | Show status: rule count, per-rule hits and idle streaks |
 | `!!logfilter list` | user | Same as above |
 | `!!logfilter test <text>` | user | Check whether a line would be hidden, and which rule matches |
-| `!!logfilter reload` | admin | Re-read the config file and apply it immediately |
+| `!!logfilter reload` | admin | Re-read the config file and apply it immediately; also forgets rules removed from it |
 | `!!logfilter reset` | admin | Clear the idle-session counters and start observing again |
 
 `!!logfilter test` is especially handy: paste a line from your log to verify the rule without waiting for it to actually fire.

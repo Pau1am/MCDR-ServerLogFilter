@@ -75,7 +75,7 @@ python -m pip install --target .testlibs -r tests/requirements-test.txt
 PYTHONPATH=.testlibs python -m pytest tests -v     # Windows: $env:PYTHONPATH=".testlibs"
 ```
 
-当前 **148 个用例**，分三层：
+当前 **156 个用例**，分三层：
 
 | 层 | 位置 | 说明 |
 |---|---|---|
@@ -86,7 +86,7 @@ PYTHONPATH=.testlibs python -m pytest tests -v     # Windows: $env:PYTHONPATH=".
 另有两个工具：
 
 ```bash
-python tools/mutation_check.py    # 故意改坏实现，确认测试会变红（14 个变异，14/14 应被抓住）
+python tools/mutation_check.py    # 故意改坏实现，确认测试会变红（18 个变异，18/18 应被抓住）
 python benchmarks/bench_filter.py # 性能基准，README / CHANGELOG 里引用的数字都由它产出
 ```
 
@@ -114,6 +114,8 @@ python tools/mcdr_matrix.py --current
 - 非法正则被跳过且产生警告，不影响其他规则
 - 近乎相同但不同的行**不**命中（证明不是无脑全过滤）
 - **零命中提醒**：达阈值才提醒、命中即归零、启动失败的周期不计入、热重载不误判、
+  **规则从配置删除后其统计立刻清除**（重载时即清，不必等服务端停止；
+  仍写在配置里但被跳过的规则不受影响；配置刚被自动重置时不动状态文件）、
   可从配置关闭、`reset` 能清空、提醒内容不重复
 - **正则安全检查**：4 类灾难性回溯模式被拦下，8 种真实写法全部放行
 - **升级提示与迁移**：旧版本格式的配置在真实 MCDR 上自动补齐，并在日志里报告新增了哪些选项；

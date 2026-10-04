@@ -1,6 +1,6 @@
 # 测试 / Tests
 
-本目录是 Server Log Filter 的测试套件。**148 个用例**，覆盖过滤行为、配置、
+本目录是 Server Log Filter 的测试套件。**156 个用例**，覆盖过滤行为、配置、
 命令面、发布打包、**真实 MCDR 端到端**，以及本插件最核心的安全属性
 （被隐去的行仍保留 `process`，事件照常分发）。
 
@@ -34,7 +34,7 @@ $env:PYTHONPATH=".testlibs"; python -m pytest tests -v
 预期输出结尾：
 
 ```
-148 passed
+156 passed
 ```
 
 ## 覆盖内容
@@ -48,13 +48,13 @@ $env:PYTHONPATH=".testlibs"; python -m pytest tests -v
 | MCDR 契约 | 2 | `InfoActionFlag.hidden()` 的常量构成；`InfoFilter` 允许改写 `action_flag` |
 | 命令面与元数据 | 8 | `on_load` 注册项；状态/测试/重载命令输出；`reload` 的 ADMIN 权限门禁；插件元数据与 `MIN_MCDR_VERSION` 同步 |
 | 发布打包 | 6 | 见下 |
-| **零命中提醒** | **16** | 阈值语义、命中归零、启动失败不计入、热重载不误判、可关闭、`reset`、历史持久化，**以及「不重复输出」**，见下 |
+| **零命中提醒** | **22** | 阈值语义、命中归零、启动失败不计入、热重载不误判、可关闭、`reset`、历史持久化、**以及「不重复输出」**，见下；另含**删除规则后统计立刻清除**（重载 / 命令两条路径、不写多余文件、不误删被拦下的规则、配置被重置时不动） |
 | **灾难性回溯防护** | **21** | 8 种真实写法全部放行；4 类危险模式被拦下；开关与超时可配置且**确实接在 `on_load` 上** |
 | **轻量化不变量** | **6** | 热路径的结构性断言（缓存 `hidden()`、无规则短路、命中即停），外加两条宽松的耗时护栏 |
 | **升级提示与迁移** | **12** | 见下 |
 | **坏配置的保全与重建** | **13** | 见下 |
-| **端到端（真实 MCDR）** | **20** | 见下 |
-| **合计** | **148** | |
+| **端到端（真实 MCDR）** | **22** | 见下 |
+| **合计** | **156** | |
 
 > 计数含 `@pytest.mark.parametrize` 展开后的用例数，与 `pytest --collect-only` 一致。
 
@@ -82,6 +82,8 @@ $env:PYTHONPATH=".testlibs"; python -m pytest tests -v
 | `test_only_the_idle_rule_is_flagged` | 本轮命中过的规则不会被牵连进提醒 |
 | `test_state_file_advances_by_one_session` | 关服后 `session_index` 与各规则的连续零命中次数被正确推进 |
 | `test_plugin_generated_its_default_config` | 首次运行生成 `config/server_log_filter/config.json`，字段与默认值正确 |
+| `test_a_deleted_rule_is_announced_as_cleaned_up` | **同一个实例目录跑两次 MCDR**，中间删掉一条规则；第二次启动时控制台出现「已清除」提示（这句只在载入阶段打印，因此能证明清理发生在重载那一刻） |
+| `test_a_deleted_rule_leaves_the_state_file` | 第二次运行后 `state.json` 里已无该规则，存活规则历史完好，`session_index == 2` |
 
 **这不是空断言**：把插件从 `plugins/` 拿掉后重跑，目标行回显 2 次，第 1 条用例会失败。
 
@@ -260,7 +262,7 @@ JSON 很严格，手工加规则时漏一个逗号就会解析失败，而 MCDR 
 python tools/mutation_check.py
 ```
 
-脚本会依次注入 14 个缺陷，要求相关用例变红；全绿即视为测试失效。已确认能被抓住的变异：
+脚本会依次注入 18 个缺陷，要求相关用例变红；全绿即视为测试失效。已确认能被抓住的变异：
 
 | 变异 | 抓住它的用例 |
 |---|---|
@@ -280,6 +282,10 @@ python tools/mutation_check.py
 | 不再提示配置已被重置 | `test_backup_announcement_says_what_where_and_why` |
 | 关闭灾难性回溯探测 | `test_on_load_actually_applies_the_probe` 等 |
 | 提醒时机提前到 `Done` 之前 | `test_stale_rule_warning_arrives_after_the_server_finished_starting` |
+| 载入时不再清理已删除规则的统计 | `test_deleting_a_rule_prunes_its_state_immediately_on_plugin_reload` 等 |
+| `!!logfilter reload` 不再清理已删除规则的统计 | `test_deleting_a_rule_prunes_its_state_on_the_reload_command` |
+| 孤立项按「编译成功的规则」而非配置原文判断 | `test_a_rule_rejected_by_the_safety_probe_keeps_its_history` |
+| 忽略「配置刚被自动重置」的保护 | `test_a_reset_config_does_not_wipe_the_rule_history` |
 
 > 教训留在这里：本套件的端到端组**曾经**声称能挡住 `hidden()` → `discarded()` 的回归，
 > 实测 6 条用例全部漏过，只有 2 条单元用例抓到。现在那条属性由

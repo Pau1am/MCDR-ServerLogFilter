@@ -378,6 +378,10 @@ _session_reached_startup = False
 # _announce_new_options 负责报告。
 _newly_added_options: List[str] = []
 
+# 本次加载时配置文件是否因为写坏而被自动重置过。重置后 patterns 是默认值而非用户
+# 真实配置，据此清理 state.json 会误删用户的历史统计，所以 _prune_state 会跳过。
+_config_was_reset = False
+
 
 def _log_summary(server: PluginServerInterface, rules: List[Rule]) -> None:
     if rules:
@@ -445,10 +449,10 @@ def _announce_new_options(server: PluginServerInterface) -> None:
 
 
 def _load_config(server: PluginServerInterface) -> Config:
-    """读取配置：自动补齐新增选项与说明字段，并在有新增时给出提示。"""
-    global _newly_added_options
+    """读取配置：自动补齐新增选项，并在有新增时给出提示。"""
+    global _newly_added_options, _config_was_reset
     _newly_added_options = []
-    _quarantine_broken_config(server, CONFIG_FILE_NAME)
+    _config_was_reset = _quarantine_broken_config(server, CONFIG_FILE_NAME) is not None
     config = server.load_config_simple(target_class=Config, data_processor=_config_migrator)
     _announce_new_options(server)
     return config
@@ -521,16 +525,75 @@ def _quarantine_broken_config(
     return reason
 
 
+def _orphan_patterns(state: State, patterns: List[str]) -> List[str]:
+    """列出 state.json 里「配置中已经没有了」的规则。
+
+    对照的是**配置原文**，而不是编译成功的规则：一条仍然写在配置里、只是当前
+    编译失败的规则（正则写错、或触发灾难性回溯保护被跳过）不该被当成已删除——
+    否则把错别字改好之后，它的历史统计已经从零开始了。
+    """
+    configured = set()
+    for raw in patterns:
+        pattern = (raw or "").strip()
+        if pattern:
+            configured.add(pattern)
+    return [pattern for pattern in state.rules if pattern not in configured]
+
+
+def _forget_orphans(state: State, patterns: List[str]) -> List[str]:
+    """就地删掉孤立的规则统计，返回被删掉的 pattern（不写盘）。
+
+    **配置刚因写坏而被自动重置时不清理。** 那一刻 ``patterns`` 是临时生成的默认值，
+    并不是用户真实配置；照此清理会把用户所有规则的历史一并抹掉，而这些统计在用户
+    对照 ``config.json.old`` 把内容改回来之后本可以继续用。
+    """
+    if _config_was_reset:
+        return []
+    removed = _orphan_patterns(state, patterns)
+    for pattern in removed:
+        del state.rules[pattern]
+    return removed
+
+
+def _prune_state(
+    server: PluginServerInterface, state: State, patterns: List[str]
+) -> List[str]:
+    """把「配置里已删除」的规则统计从 state.json 里清掉。
+
+    只在真的清掉了东西时才写盘：没有变化就一个字节都不动，避免每次重载都白白
+    改一次文件的修改时间。
+
+    这在**重载时**就要做，而不是等到服务端停止：``_update_state_after_session``
+    虽然也会清理，但它只在一个开服周期正常结束（``on_server_stop``）时才跑。
+    管理员删掉一条规则后立刻看 ``state.json``，看到的是那份已经没用的旧统计。
+    """
+    removed = _forget_orphans(state, patterns)
+    if removed:
+        _save_state(server, state)
+    return removed
+
+
+def _announce_pruned(server: PluginServerInterface, removed: List[str]) -> None:
+    """告诉管理员 state.json 里清掉了哪些统计（配置里已删除的规则）。"""
+    if not removed:
+        return
+    lines = [
+        "[ServerLogFilter] 已从 state.json 清除 {} 条规则统计（它们已不在配置的 patterns 中）".format(
+            len(removed)
+        ),
+    ]
+    lines += ["  · {}".format(pattern) for pattern in removed]
+    server.logger.info("\n".join(lines))
+
+
 def _update_state_after_session(
-    server: PluginServerInterface, state: State, rules: List[Rule]
+    server: PluginServerInterface, state: State, rules: List[Rule], patterns: List[str]
 ) -> None:
     """一次开服周期结束时，把命中数写进历史并推进「连续零命中」计数。"""
     state.session_index += 1
     session_index = state.session_index
 
-    configured = set()
     for rule in rules:
-        configured.add(rule.pattern)
         entry = state.rules.get(rule.pattern)
         if entry is None:
             entry = RuleState()
@@ -544,8 +607,7 @@ def _update_state_after_session(
             entry.zero_streak += 1
 
     # 已从配置中移除的规则一并清掉，避免状态文件无限增长
-    for pattern in [p for p in state.rules if p not in configured]:
-        del state.rules[pattern]
+    _forget_orphans(state, patterns)
 
     _save_state(server, state)
 
@@ -631,6 +693,9 @@ def on_load(server: PluginServerInterface, prev_module) -> None:
     )
     _log_filter = ServerLogFilter(rules, server.logger, _config.log_matched_lines)
 
+    # 配置里删掉的规则，其统计立刻清掉（重载后就该消失，不必等到服务端停止）。
+    _announce_pruned(server, _prune_state(server, _state, _config.patterns))
+
     # 热重载：把上一份实例已有的命中数接过来，避免把一次开服周期切成两段后误判零命中。
     carried = _log_filter.carry_over_from(getattr(prev_module, "_log_filter", None))
     if carried:
@@ -668,8 +733,11 @@ def on_load(server: PluginServerInterface, prev_module) -> None:
     _log_summary(server, rules)
 
 
-def _apply_config(server: PluginServerInterface) -> List[Rule]:
-    """重读配置并就地替换规则，不重新注册命令与过滤器。"""
+def _apply_config(server: PluginServerInterface) -> Tuple[List[Rule], List[str]]:
+    """重读配置并就地替换规则，不重新注册命令与过滤器。
+
+    返回 ``(规则列表, 被清掉的旧规则统计)``，后者供调用方提示管理员。
+    """
     global _config
     _config = _load_config(server)
     rules = _build_rules(
@@ -680,7 +748,8 @@ def _apply_config(server: PluginServerInterface) -> List[Rule]:
     )
     if _log_filter is not None:
         _log_filter.reload_rules(rules, _config.log_matched_lines)
-    return rules
+    pruned = [] if _state is None else _prune_state(server, _state, _config.patterns)
+    return rules, pruned
 
 
 def on_server_start(server: PluginServerInterface) -> None:
@@ -722,7 +791,9 @@ def on_server_stop(server: PluginServerInterface, server_return_code: int) -> No
     # 只有真正完成过启动的周期才计入统计，避免「启动失败」污染零命中计数。
     if _session_reached_startup and _state is not None:
         try:
-            _update_state_after_session(server, _state, list(_log_filter.rules))
+            _update_state_after_session(
+                server, _state, list(_log_filter.rules), _config.patterns
+            )
         except Exception:  # noqa: BLE001 - 状态写盘失败不应影响服务端收尾
             server.logger.exception("写入日志过滤统计（state.json）失败")
     _session_reached_startup = False
@@ -800,14 +871,21 @@ def _reload(source) -> None:
     if _server is None:
         source.reply(RText("插件尚未初始化，无法重载", RColor.red))
         return
-    rules = _apply_config(_server)
+    rules, pruned = _apply_config(_server)
     _log_summary(_server, rules)
-    source.reply(
-        RTextList(
-            RText("已重载日志过滤规则", RColor.green),
-            RText("（当前 {} 条）".format(len(rules)), RColor.gray),
-        )
+    _announce_pruned(_server, pruned)
+    reply = RTextList(
+        RText("已重载日志过滤规则", RColor.green),
+        RText("（当前 {} 条）".format(len(rules)), RColor.gray),
     )
+    if pruned:
+        reply.append(
+            RText(
+                "；已清除 {} 条已删除规则的统计".format(len(pruned)),
+                RColor.gray,
+            )
+        )
+    source.reply(reply)
 
 
 def _reset_streaks(source) -> None:

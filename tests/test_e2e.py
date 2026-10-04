@@ -572,3 +572,61 @@ def test_plugin_still_works_after_a_config_reset(broken_config_e2e_output):
     echoed = echoed_server_lines(output)
     assert [l for l in echoed if TARGET in l] == [], "filtering stopped working"
     assert (root / "startup_event_fired").is_file(), "lifecycle events broke"
+
+
+# ---------------------------------------------------------------------------
+#  a rule removed from the config is forgotten immediately
+# ---------------------------------------------------------------------------
+
+DELETED_PATTERN = "a-rule-the-admin-deleted"
+
+
+@pytest.fixture(scope="module")
+def pruned_e2e_output(tmp_path_factory):
+    """Run MCDR twice in one instance, deleting a rule from config in between.
+
+    This is the exact sequence an admin performs: remove the entry, then have the
+    plugin reloaded. Before the fix the stale history survived until the next
+    server *stop*, so a glance at ``state.json`` right after the reload still
+    showed the rule that had just been deleted.
+    """
+    _require_mcdr()
+    root = tmp_path_factory.mktemp("mcdr_e2e_prune")
+    _build_instance(root, plugin_config={"patterns": [TARGET, DELETED_PATTERN]})
+    run_mcdr(root)
+
+    folder = root / "config" / "server_log_filter"
+    before = json.loads((folder / "state.json").read_text(encoding="utf-8"))
+    assert DELETED_PATTERN in before["rules"], "the first run should have recorded the rule"
+
+    # the admin deletes the rule and saves the file
+    cfg_path = folder / "config.json"
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    cfg["patterns"] = [TARGET]
+    cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+    # a second, entirely separate MCDR process -> the plugin is loaded afresh
+    return run_mcdr(root), root
+
+
+def test_a_deleted_rule_is_announced_as_cleaned_up(pruned_e2e_output):
+    """The cleanup happens at load time, and says so.
+
+    Nothing on the session-stop path logs this sentence, so seeing it proves the
+    pruning ran while the plugin was being loaded.
+    """
+    output, _ = pruned_e2e_output
+    assert "已从 state.json 清除 1 条规则统计" in output, "the cleanup was never announced"
+    assert DELETED_PATTERN in output, "the admin must be told which rule was forgotten"
+
+
+def test_a_deleted_rule_leaves_the_state_file(pruned_e2e_output):
+    _, root = pruned_e2e_output
+    state = json.loads(
+        (root / "config" / "server_log_filter" / "state.json").read_text(encoding="utf-8")
+    )
+    assert DELETED_PATTERN not in state["rules"], "the deleted rule is still being tracked"
+    assert TARGET in state["rules"], "the surviving rule must keep its history"
+    # both runs completed, so the config really was healthy — the rule was not
+    # dropped because of some unrelated failure
+    assert state["session_index"] == 2

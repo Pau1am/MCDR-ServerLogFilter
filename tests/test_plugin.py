@@ -133,7 +133,12 @@ class FakePluginServer:
         return self.config
 
     def save_config_simple(self, config, file_name=None, **kwargs):
-        self.saved[file_name] = config.serialize()
+        data = config.serialize()
+        self.saved[file_name] = data
+        if file_name == slf.STATE_FILE_NAME:
+            # Mirror MCDR writing the file to disk: a later on_load in the same
+            # test reads it back, exactly like a plugin reload would.
+            self.state_data = data
 
 
 # The set of noisy lines this plugin exists to suppress (server side, MC 26.3).
@@ -855,6 +860,121 @@ def test_state_forgets_patterns_that_left_the_config():
     slf._apply_config(server)
     run_session(server)
     assert set(slf._state.rules) == {LIVE}, "removed patterns must be pruned from the state file"
+
+
+def state_rules_of(server):
+    return set(server.saved[slf.STATE_FILE_NAME]["rules"])
+
+
+def test_deleting_a_rule_prunes_its_state_immediately_on_plugin_reload():
+    """The admin should not have to wait for a whole server session.
+
+    Pruning used to happen only in on_server_stop, so a rule deleted and the
+    plugin reloaded stayed in state.json until the next successful shutdown.
+    """
+    server = start_plugin(config={"patterns": [LIVE, IDLE], "stale_rule_threshold": 1})
+    run_session(server)
+    assert state_rules_of(server) == {LIVE, IDLE}
+
+    server.config_data = {"patterns": [LIVE], "stale_rule_threshold": 1}
+    slf.on_load(server, None)          # !!MCDR reload plugin
+
+    assert state_rules_of(server) == {LIVE}, "the deleted rule must be gone right away"
+    assert IDLE not in slf._state.rules
+
+
+def test_deleting_a_rule_prunes_its_state_on_the_reload_command():
+    server = start_plugin(config={"patterns": [LIVE, IDLE], "stale_rule_threshold": 1})
+    run_session(server)
+
+    server.config_data = {"patterns": [LIVE], "stale_rule_threshold": 1}
+    source = FakeSource()
+    slf._reload(source)
+
+    assert state_rules_of(server) == {LIVE}
+    assert "已清除 1 条已删除规则的统计" in "".join(str(x) for x in source.replies)
+
+
+def test_pruning_does_not_touch_the_file_when_nothing_was_deleted():
+    """No change, no write: state.json must not be rewritten on every reload."""
+    server = start_plugin(config={"patterns": [LIVE, IDLE], "stale_rule_threshold": 1})
+    run_session(server)
+
+    server.saved.clear()
+    slf.on_load(server, None)
+
+    assert server.saved == {}, "an unchanged state must not be written back"
+
+
+def test_a_rule_rejected_by_the_safety_probe_keeps_its_history():
+    """Only rules whose text has actually left ``patterns`` may be forgotten.
+
+    Pruning must compare against the *configured* patterns, not the compiled
+    rules: a rule that is still written down but gets skipped at load time
+    (here, rejected by the catastrophic-backtracking guard after an upgrade)
+    is not a deletion, and starting its statistics over would be a regression.
+    """
+    danger = r"(a+)+$"
+    server = start_plugin(
+        config={
+            "patterns": [LIVE, danger],
+            "stale_rule_threshold": 1,
+            "validate_patterns": False,
+        }
+    )
+    run_session(server)
+    assert danger in slf._state.rules
+
+    # the same two patterns, but the probe is on now, so the dangerous one is skipped
+    server.config_data = {
+        "patterns": [LIVE, danger],
+        "stale_rule_threshold": 1,
+        "validate_patterns": True,
+    }
+    slf._apply_config(server)
+
+    assert all(rule.pattern != danger for rule in slf._log_filter.rules), "it is skipped"
+    assert danger in slf._state.rules, "still configured, so still remembered"
+
+
+def test_a_reset_config_does_not_wipe_the_rule_history(tmp_path):
+    """A syntax error must not cost the admin every rule's history.
+
+    When config.json is broken it is quarantined and regenerated with defaults, so
+    the patterns seen at that moment are *not* what the user configured. Pruning
+    against them would throw away statistics that are recoverable once the file is
+    restored by hand.
+    """
+    server, folder = server_with_config_file(tmp_path, BROKEN_JSON)
+    server.state_data = {
+        "session_index": 4,
+        "rules": {
+            LIVE: {"hits_last_session": 2, "zero_streak": 0, "total_hits": 9, "last_hit_session": 4},
+            IDLE: {"hits_last_session": 0, "zero_streak": 3, "total_hits": 0, "last_hit_session": 0},
+        },
+    }
+
+    slf.on_load(server, None)
+
+    assert set(slf._state.rules) == {LIVE, IDLE}, "the history must survive the reset"
+    assert slf.STATE_FILE_NAME not in server.saved, "nothing may be written back either"
+
+    # ...and the session-end cleanup must not quietly finish the job either
+    run_session(server, hits={LIVE: 1})
+    assert set(slf._state.rules) == {LIVE, IDLE}, "the history must survive the session too"
+
+
+def test_pruning_announces_what_it_removed():
+    server = start_plugin(config={"patterns": [LIVE, IDLE], "stale_rule_threshold": 1})
+    run_session(server)
+    server.logger.infos.clear()
+
+    server.config_data = {"patterns": [LIVE], "stale_rule_threshold": 1}
+    slf.on_load(server, None)
+
+    text = "\n".join(server.logger.infos)
+    assert "已从 state.json 清除 1 条规则统计" in text
+    assert IDLE in text, "the admin needs to know which rule was forgotten"
 
 
 def test_state_file_round_trips_through_json():
