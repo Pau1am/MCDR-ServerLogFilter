@@ -213,7 +213,7 @@ MCDR 会把服务端打印的每一行原样回显到控制台。绝大多数情
 
 ### 运行测试
 
-上面的行为都有对应的自动化测试（`tests/`，共 112 个用例），可以在真实 MCDR 上复跑——**包括本节
+上面的行为都有对应的自动化测试（`tests/`，共 113 个用例），可以在真实 MCDR 上复跑——**包括本节
 「端到端」这一组**，它会启动一个真正的 MCDR 实例、加载 `pack.py` 产出的 `.mcdr`、并用假服务端
 跑完整个生命周期：
 
@@ -230,24 +230,36 @@ PYTHONPATH=.testlibs python -m pytest tests -v      # Windows: $env:PYTHONPATH="
 
 ## 自行打包
 
-本插件是 MCDR 标准的「根元数据 + 同名代码子包」：
+本插件是 MCDR 标准的「根元数据 + 同名代码子包」。仓库结构：
 
 ```
 MCDR-ServerLogFilter/
 ├── mcdreforged.plugin.json
 ├── LICENSE
-├── README.md
-├── README_en.md
+├── README.md            ← 不进发布包
+├── README_en.md         ← 不进发布包
 ├── CHANGELOG.md
 └── server_log_filter/
     └── __init__.py
 ```
 
-打包时**只准放行上面这些文件**，用「白名单」而不是「黑名单」。仓库里已经附带了这个打包脚本：
+打包时**只放行白名单里的文件**，而不是「排除一批文件」：
 
 ```bash
 python pack.py            # 生成 ServerLogFilter-v<版本号>.mcdr
 ```
+
+发布包里只有 **4 个文件**（约 14 KiB）：
+
+| 文件 | 说明 |
+|---|---|
+| `mcdreforged.plugin.json` | 插件元数据（必需） |
+| `server_log_filter/__init__.py` | 插件代码 |
+| `CHANGELOG.md` | 变更记录，随包分发 |
+| `LICENSE` | MIT 许可证 |
+
+两个 README **不打包**：MCDR 从不读取它们，内容与 Releases 页面重复，而去掉后
+产物体积直接减半（28 KB → 14 KB）。
 
 > **为什么必须用白名单？** 早期版本的这一节用的是 `rglob("*")` 加一个很短的 `skip` 列表，
 > 那是**黑名单**思路，会被仓库里任何新文件悄悄带进发布包。两个具体后果：
@@ -257,10 +269,11 @@ python pack.py            # 生成 ServerLogFilter-v<版本号>.mcdr
 >    `IllegalPluginStructure: Packed plugin cannot contain other module`。测试用的
 >    `conftest.py` 恰好就在根目录，所以黑名单方案会让插件**完全无法加载**。
 > 2. **体积失控。** 按 `tests/README.md` 装了 `.testlibs/` 之后，黑名单会把整个 MCDR
->    及其依赖一起打进包里：实测 **1362 个文件、7.11 MB**（白名单为 6 个文件、约 17 KiB）。
+>    及其依赖一起打进包里：实测 **1362 个文件、7.11 MB**。
 >
 > `tests/test_plugin.py` 里的 `test_packaged_artifact_is_loadable` 会跑一遍 `pack.py`，
-> 并用 MCDR 自己的校验逻辑检查产物，所以这类回归不会再溜过去。
+> 并用 MCDR 自己的校验逻辑检查产物；`test_packager_ships_exactly_the_allowlist` 则把
+> 产物内容钉死，防止清单再被无意改动。
 >
 > `pack.py` 本身不进包，原因和 `conftest.py` 相同——根级模块会让 MCDR 拒绝加载。
 

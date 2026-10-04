@@ -562,6 +562,29 @@ def test_packager_excludes_repo_infrastructure(tmp_path):
     assert not [n for n in names if "__pycache__" in n or n.endswith(".pyc")]
 
 
+def test_packager_ships_exactly_the_allowlist(tmp_path):
+    """Pin the shipped file set so the allowlist cannot drift unnoticed.
+
+    A packaging change that nobody announces shows up to users as "the plugin got
+    much bigger for no reason". Listing the exact contents here makes any change
+    to that list a deliberate, visible edit.
+
+    The READMEs are deliberately absent: MCDR never reads them, and together they
+    accounted for over half the artifact (28 KB -> 14 KB without them).
+    """
+    _, names = _build_package(tmp_path)
+
+    assert sorted(names) == [
+        "CHANGELOG.md",
+        "LICENSE",
+        "mcdreforged.plugin.json",
+        "server_log_filter/__init__.py",
+    ], names
+
+    for excluded in ("README.md", "README_en.md"):
+        assert excluded not in names, "{} must not be shipped".format(excluded)
+
+
 def test_packager_keeps_artifact_small(tmp_path):
     """A stray .testlibs/ once blew this up to 1362 files / 7.11 MB."""
     out, names = _build_package(tmp_path)
