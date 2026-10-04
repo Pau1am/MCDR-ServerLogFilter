@@ -68,15 +68,23 @@ Running several backends? Put one copy in each — configurations are independen
         "standing on air - force-sending blocks below"
     ],
     "log_matched_lines": false,
-    "report_on_server_stop": true
+    "report_on_server_stop": true,
+    "warn_about_stale_rules": true,
+    "stale_rule_threshold": 3,
+    "validate_patterns": true,
+    "pattern_probe_timeout_ms": 25
 }
 ```
 
-| Key | Type | Description |
-|---|---|---|
-| `patterns` | `string[]` | Regex rules. Matched against the **body** of each line (MCDR has already stripped the `[time] [thread/level]:` prefix). A match hides the line |
-| `log_matched_lines` | `bool` | Debug aid. When `true`, every hidden line is written to the MCDR log at INFO level |
-| `report_on_server_stop` | `bool` | On server stop, log a summary of how many lines were hidden this run |
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `patterns` | `string[]` | see above | Regex rules. Matched against the **body** of each line (MCDR has already stripped the `[time] [thread/level]:` prefix). A match hides the line |
+| `log_matched_lines` | `bool` | `false` | Debug aid. When `true`, every hidden line is written to the MCDR log at INFO level |
+| `report_on_server_stop` | `bool` | `true` | On server stop, log a summary of how many lines were hidden this run |
+| `warn_about_stale_rules` | `bool` | `true` | Warn when a rule has matched nothing for several sessions — see below |
+| `stale_rule_threshold` | `int` | `3` | How many consecutive idle sessions before warning. `0` disables the warning |
+| `validate_patterns` | `bool` | `true` | Check rules for catastrophic backtracking at load time — see below |
+| `pattern_probe_timeout_ms` | `int` | `25` | Time budget for that check, in milliseconds. Rarely needs changing |
 
 > **Matching uses `re.search` (substring match), not full match.**
 > Writing `standing on air` matches the whole line — no `.*` needed.
@@ -84,14 +92,56 @@ Running several backends? Put one copy in each — configurations are independen
 
 The config file is JSON and **does not support comments**.
 
+### Idle-rule reminder
+
+If a rule matches nothing for several consecutive sessions, it is most likely dead weight:
+either the regex is wrong (typo, letter case, escaping), or the log line it targets is gone
+for good (for instance because the upstream bug got fixed). The plugin says so once, right
+after the server finishes starting (i.e. after the `Done` line):
+
+```
+==================================================================
+[ServerLogFilter] 注意：有 1 条过滤规则连续 3 次及以上开服都没有命中
+  · standing on air - force-sending blocks below
+      已连续 3 次开服零命中；自启用以来从未命中过
+  ...
+==================================================================
+```
+
+Worth knowing:
+
+- **This is not a performance feature.** All bookkeeping happens at server start/stop; the
+  per-line filtering path gains no extra work. Its purpose is keeping the config honest.
+- The history lives in `config/server_log_filter/state.json`, separate from the `config.json`
+  you edit. The plugin never touches your config.
+- If a rule is legitimately rare (fires once a month, say), raise `stale_rule_threshold`, or
+  use `!!logfilter reset` to clear the counters and start observing again.
+- Only sessions that actually **finished starting** are counted, so a server that fails to boot
+  cannot make every rule look idle.
+
+### Regex safety check
+
+A regex with nested quantifiers (e.g. `(a+)+$`) backtracks exponentially when it fails to match,
+which can freeze MCDR for hundreds of milliseconds — or seconds — **per line**. On load, the
+plugin tries every rule against a few very short probe strings and refuses the dangerous ones
+with a clear error:
+
+```
+[ServerLogFilter] 过滤规则存在灾难性回溯风险，已跳过: '(a+)+$' —— 在 22 字符的探测串上已耗时 90 ms（上限 25 ms）。
+```
+
+The check runs once at load; realistic patterns cost microseconds, and a refused rule never
+affects the others. Leave `validate_patterns` on unless you know exactly what you are doing.
+
 ## Commands
 
 | Command | Permission | Description |
 |---|---|---|
-| `!!logfilter` | user | Show status: rule count and per-rule hit counts |
+| `!!logfilter` | user | Show status: rule count, per-rule hits and idle streaks |
 | `!!logfilter list` | user | Same as above |
 | `!!logfilter test <text>` | user | Check whether a line would be hidden, and which rule matches |
 | `!!logfilter reload` | admin | Re-read the config file and apply it immediately |
+| `!!logfilter reset` | admin | Clear the idle-session counters and start observing again |
 
 `!!logfilter test` is especially handy: paste a line from your log to verify the rule without waiting for it to actually fire.
 
@@ -130,6 +180,11 @@ A malformed regex will not crash the plugin — the rule is skipped with a warni
 - Multiple rules keep independent counts; `reload` resets counters
 - An invalid regex is skipped with a warning and does not affect other rules
 - Nearly-identical-but-different lines are **not** matched (proving it is not a blanket filter)
+- **Idle-rule reminder**: fires only at the threshold, a single hit resets the streak, sessions that
+  never finished starting are ignored, a plugin reload cannot fake an idle rule, it can be switched
+  off, and `reset` clears the counters
+- **Regex safety check**: four classes of catastrophic-backtracking pattern are refused, while eight
+  realistic rule shapes all pass
 
 ### End-to-end (real MCDR + a fake server, full lifecycle)
 
@@ -146,7 +201,7 @@ Observed console echo (default rule):
 Plugin log:
 
 ```
-Plugin server_log_filter@1.0.2 loaded
+Plugin server_log_filter@1.1.0 loaded
 Enabled 1 log filter rule; matches are hidden from the MCDR console only, the server log is unaffected
 Hidden 3 server log lines from the MCDR console this run (server log file unaffected)
 ```
@@ -161,7 +216,7 @@ because noise lines never take part in lifecycle detection. See [tests/README.md
 
 ### Running the tests
 
-The behaviour above is covered by an automated suite (`tests/`, 66 cases) that runs against a real
+The behaviour above is covered by an automated suite (`tests/`, 112 cases) that runs against a real
 MCDR — **including the end-to-end group below**, which boots an actual MCDR instance, loads the
 `.mcdr` produced by `pack.py`, and drives a fake server through a full lifecycle:
 
@@ -234,7 +289,7 @@ python pack.py            # -> ServerLogFilter-v<version>.mcdr
 
 | Dimension | Support |
 |---|---|
-| MCDR | **>= 2.15.0** (2.15.0 / 2.15.7 / 2.16.0 tested) |
+| MCDR | **>= 2.15.0** |
 | Minecraft | **Independent of the MC version.** 1.16.5 / 1.19.4 / 1.20.1 / 1.20.6 / 1.21.8 / 1.21.11 / 26.1 / 26.2 / 26.3 all tested against real servers |
 
 Filtering happens on the MCDR side (matching each line of the server's stdout), so it does
@@ -242,6 +297,24 @@ not change with the MC version. The only version-dependent part is **what the de
 targets**: `standing on air - force-sending blocks below` is only produced by **MC 26.3**.
 On earlier versions the plugin still works — the default rule simply never matches anything,
 and you can configure `patterns` to filter whatever noise your version emits.
+
+### MCDR versions, measured
+
+| MCDR | Result |
+|---|---|
+| 2.13.0 / 2.14.1 | Blocked by MCDR's own dependency check: `dependency mcdreforged@x.y.z does not satisfy version requirement >=2.15.0` |
+| **2.15.0** (minimum) | Loading, filtering, idle-rule reminder, state file, and commands (including `!!logfilter reset`) all verified |
+| 2.15.7 | Same — all verified |
+| 2.16.0 | Same — all verified |
+
+The reason the floor is 2.15.0 is explained under [Requirements](#requirements).
+Every feature — including the idle-rule reminder and the regex safety check added in
+v1.1.0 — behaves **identically** on these three versions (same warning timing, same
+idle-streak bookkeeping, same state file, same command tree, no exceptions).
+
+> The APIs the v1.1.0 features rely on (`save_config_simple`, `load_config_simple` with
+> `file_name`, nested `Serializable`, `on_server_startup`) have all existed since
+> **MCDR 2.13.0**, so **the minimum version requirement is unchanged at 2.15.0**.
 
 ## License
 

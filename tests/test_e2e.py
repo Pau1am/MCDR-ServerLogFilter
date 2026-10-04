@@ -122,7 +122,7 @@ def _require_mcdr() -> None:
         pytest.skip("mcdreforged is not importable by " + sys.executable)
 
 
-def _build_instance(root: Path) -> Path:
+def _build_instance(root: Path, plugin_config: dict = None, state: dict = None) -> Path:
     """Create an MCDR instance in ``root`` that loads the packaged plugin."""
     (root / "server").mkdir(parents=True)
     (root / "plugins").mkdir()
@@ -144,17 +144,21 @@ def _build_instance(root: Path) -> Path:
     # what gives the end-to-end run the power to tell hidden() and discarded()
     # apart: the line leaves the console either way, but only hidden() keeps
     # dispatching it — and therefore keeps firing SERVER_STARTUP.
+    cfg = {
+        "patterns": [TARGET, CANARY_PATTERN],
+        "log_matched_lines": False,
+        "report_on_server_stop": True,
+    }
+    if plugin_config:
+        cfg.update(plugin_config)
     (root / "config" / "server_log_filter" / "config.json").write_text(
-        json.dumps(
-            {
-                "patterns": [TARGET, CANARY_PATTERN],
-                "log_matched_lines": False,
-                "report_on_server_stop": True,
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
+        json.dumps(cfg, indent=2), encoding="utf-8"
     )
+
+    if state is not None:
+        (root / "config" / "server_log_filter" / "state.json").write_text(
+            json.dumps(state, indent=2), encoding="utf-8"
+        )
 
     # Load the real distribution artifact, not the source tree.
     sys.path.insert(0, str(REPO))
@@ -311,6 +315,131 @@ def test_plugin_generated_its_default_config(e2e_output):
     assert cfg.is_file(), "plugin did not create its config file"
 
     data = json.loads(cfg.read_text(encoding="utf-8"))
-    assert set(data) == {"patterns", "log_matched_lines", "report_on_server_stop"}
+    assert set(data) == {
+        "patterns",
+        "log_matched_lines",
+        "report_on_server_stop",
+        "warn_about_stale_rules",
+        "stale_rule_threshold",
+        "validate_patterns",
+        "pattern_probe_timeout_ms",
+    }
     assert TARGET in data["patterns"]
     assert CANARY_PATTERN in data["patterns"]
+
+
+def test_plugin_keeps_its_state_file_out_of_the_user_config(e2e_output):
+    """The per-session history must live in its own file, not in config.json."""
+    _, root = e2e_output
+    folder = root / "config" / "server_log_filter"
+    state = folder / "state.json"
+    assert state.is_file(), "plugin did not write its state file"
+
+    data = json.loads(state.read_text(encoding="utf-8"))
+    assert set(data) == {"session_index", "rules"}
+    # one completed session was recorded
+    assert data["session_index"] == 1
+
+    # config.json must stay exactly as the user left it (no history mixed in)
+    cfg = json.loads((folder / "config.json").read_text(encoding="utf-8"))
+    assert "rules" not in cfg and "session_index" not in cfg
+
+
+def test_healthy_run_reports_no_stale_rule(e2e_output):
+    """First ever run has no history, and both rules did match — nothing to warn about."""
+    output, _ = e2e_output
+    assert "都没有命中" not in output
+
+
+# ---------------------------------------------------------------------------
+#  stale-rule warning (a second, separate MCDR run with pre-seeded history)
+# ---------------------------------------------------------------------------
+
+STALE_PATTERN = "a-rule-that-never-matched-anything"
+STALE_THRESHOLD = 2
+
+
+@pytest.fixture(scope="module")
+def stale_e2e_output(tmp_path_factory):
+    """One MCDR run whose state file already says a rule has been idle for 5 sessions.
+
+    The canary rule is deliberately *not* used here: the startup line must stay
+    visible so the ordering assertion can compare the warning against the real
+    ``Done`` line.
+    """
+    _require_mcdr()
+    root = tmp_path_factory.mktemp("mcdr_e2e_stale")
+    _build_instance(
+        root,
+        plugin_config={
+            "patterns": [TARGET, STALE_PATTERN],
+            "stale_rule_threshold": STALE_THRESHOLD,
+        },
+        state={
+            "session_index": 5,
+            "rules": {
+                STALE_PATTERN: {
+                    "hits_last_session": 0,
+                    "zero_streak": 5,
+                    "total_hits": 0,
+                    "last_hit_session": 0,
+                }
+            },
+        },
+    )
+    return run_mcdr(root), root
+
+
+def test_stale_rule_warning_arrives_after_the_server_finished_starting(stale_e2e_output):
+    """The whole point of the feature: reported, and reported *after* startup.
+
+    Anchoring on the server's own ``Done`` line is what makes this meaningful —
+    a warning emitted at load time (or during the startup flood) would be missed
+    by whoever needs to read it.
+    """
+    output, root = stale_e2e_output
+    assert STALE_PATTERN in output, "the idle rule was never reported"
+
+    done_at = output.find('Done (0.648s)! For help, type "help"')
+    warn_at = output.find("都没有命中")
+    assert done_at != -1, "the fake server never printed its startup line"
+    assert warn_at != -1, "no stale-rule warning was emitted"
+    assert warn_at > done_at, (
+        "the stale-rule warning must arrive only after the server finished starting "
+        "(i.e. after the 'Done' line); otherwise it drowns in the startup output"
+    )
+    # MCDR really did treat the session as started (independent corroboration)
+    assert (root / "startup_event_fired").is_file()
+
+
+def test_stale_rule_warning_is_specific_and_actionable(stale_e2e_output):
+    output, _ = stale_e2e_output
+    assert "连续 {} 次及以上开服都没有命中".format(STALE_THRESHOLD) in output  # threshold honoured
+    assert "已连续 5 次开服零命中" in output          # the real streak, not just the threshold
+    assert "从未命中过" in output                      # no history of ever matching
+    assert "!!logfilter test" in output                # tells the admin how to check
+    assert "!!logfilter reset" in output               # and how to silence it
+
+
+def test_only_the_idle_rule_is_flagged(stale_e2e_output):
+    """A rule that did match in this run must not be dragged into the warning."""
+    output, _ = stale_e2e_output
+    assert "有 1 条过滤规则连续" in output
+    warning = output[output.find("都没有命中") - 200: output.find("=====") if "=====" in output else -1]
+    assert TARGET not in warning
+
+
+def test_state_file_advances_by_one_session(stale_e2e_output):
+    _, root = stale_e2e_output
+    state = json.loads(
+        (root / "config" / "server_log_filter" / "state.json").read_text(encoding="utf-8")
+    )
+    assert state["session_index"] == 6  # 5 -> 6
+
+    idle = state["rules"][STALE_PATTERN]
+    assert idle["zero_streak"] == 6  # 5 -> 6
+    assert idle["total_hits"] == 0
+
+    # the rule that did match is recorded with a fresh (zero) streak
+    assert state["rules"][TARGET]["zero_streak"] == 0
+    assert state["rules"][TARGET]["hits_last_session"] == 2
