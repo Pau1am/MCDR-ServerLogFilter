@@ -333,7 +333,9 @@ Those same lines are **still complete** in `server/logs/latest.log`.
 
 | Symptom | What to do |
 |---|---|
-| A rule does not seem to work | `!!logfilter test <a log line>` to see whether it would be hidden; then `!!logfilter reload` |
+| A rule does not seem to work | `!!logfilter test <a log line>` to see whether it would be hidden (it lists **every** matching rule); then `!!logfilter reload` |
+| The console went **completely blank** | A rule probably matches everything (`.`, `.*`, `^`, `?`, `\w*`). A warning is printed at MCDR load time, and `!!logfilter list` flags it in red |
+| Hits look wiped after a `reload` | Not since 1.4.1: a reload swaps the rules but keeps counting the ones that survived |
 | A rule is reported as idle | Its regex is probably wrong, or that log line no longer occurs — follow the advice in the reminder |
 | The config file was reset | Look for `config.json.old`: that is your original file. The message names the cause and the line number |
 | It was reset because the file is "not valid UTF-8" | Your editor saved it as ANSI/GBK; re-save it as UTF-8 (copy the content back from `config.json.old`) |

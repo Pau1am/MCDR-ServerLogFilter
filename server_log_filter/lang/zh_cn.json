@@ -6,12 +6,19 @@
   "summary.rules_enabled": "已启用 {count} 条日志过滤规则；命中后仅从 MCDR 控制台隐去，服务端日志不受影响",
   "summary.no_rules": "未启用任何过滤规则（patterns 为空或全部编译失败）",
 
+  "rule.catch_all": "过滤规则匹配一切，已保留但请检查: {pattern!r} —— 这条规则会隐去**所有**服务端输出，控制台看起来就像服务端没在运行。常见的写法错误是 `.`、`.*`、`^`、`?`、`\\w*` 这类。",
+  "rule.duplicate": "过滤规则重复，只保留第一条: {pattern!r}",
+  "status.warned_label": "匹配一切: ",
+  "status.warned": "{count} 条规则（会隐去所有输出，请检查是不是写成了 . / .* / ^ 之类）",
+  "status.duplicate_label": "重复: ",
+  "status.duplicate": "{count} 条规则（同一条写了多次，只有第一条生效）",
   "rule.hidden": "[ServerLogFilter] 已隐去: {content}",
   "rule.compile_failed": "过滤规则编译失败，已跳过: {pattern!r} ({error})",
   "rule.dangerous": "过滤规则存在灾难性回溯风险，已跳过: {pattern!r} —— {detail}。这条规则几乎每行都会让 MCDR 主线程卡顿，请改写成普通子串或去掉嵌套量词后重试。",
   "probe.too_slow": "在 {length} 字符的探测串上已耗时 {cost:.0f} ms（上限 {budget} ms）",
 
   "reload.carried": "已从重载前的实例接续 {count} 条命中计数",
+  "reload.carried_session": "；本轮已命中的 {count} 次继续保留",
   "session.report": "本次运行共从 MCDR 控制台隐去 {total} 行服务端日志（服务端日志文件不受影响）",
   "help.logfilter": "服务端日志过滤器（!!lf）：查看状态 / 测试规则 / 重载规则",
 

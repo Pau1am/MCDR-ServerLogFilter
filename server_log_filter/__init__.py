@@ -208,6 +208,23 @@ class Rule:
         self.count = 0
 
 
+def _carry_counts(rules, previous: Dict[str, int]) -> int:
+    """把上一份计数按 ``pattern`` 搬到新规则对象上，返回接续到的总数。
+
+    **两条重载路径都必须调用它**：插件重载（``carry_over_from``）与命令重载
+    （``reload_rules``）。少一处，一次开服周期就会被切成两段，而统计按「每轮」结算——
+    明明在命中的规则会被记成「本轮零命中」，连续零命中计数跟着涨，
+    最终弹出「这条规则从没命中过」的假提醒。这正是本插件要消灭的那类噪音。
+    """
+    carried = 0
+    for rule in rules:
+        hits = previous.get(rule.pattern, 0)
+        if hits:
+            rule.count = hits
+            carried += hits
+    return carried
+
+
 class ServerLogFilter(InfoFilter):
     """按规则把匹配的服务端输出从控制台隐去。"""
 
@@ -232,26 +249,27 @@ class ServerLogFilter(InfoFilter):
             return self._total
 
     def carry_over_from(self, previous: Optional["ServerLogFilter"]) -> int:
-        """接续上一份实例的命中数，否则一次开服周期会被重载切成两段而误判零命中。"""
+        """接续上一份实例的命中数（插件重载路径），否则一次开服周期会被切成两段。"""
         if previous is None:
             return 0
         previous_counts = {rule.pattern: rule.count for rule in previous.rules if rule.count}
-        carried = 0
         with self._lock:
-            for rule in self._rules:
-                hits = previous_counts.get(rule.pattern, 0)
-                if hits:
-                    rule.count = hits
-                    carried += hits
-            self._total = carried
-        return carried
+            self._total = _carry_counts(self._rules, previous_counts)
+            return self._total
 
-    def reload_rules(self, rules: List[Rule], log_matched_lines: bool) -> None:
-        """就地替换规则，无需重新注册 InfoFilter。"""
+    def reload_rules(self, rules: List[Rule], log_matched_lines: bool) -> int:
+        """就地替换规则，无需重新注册 InfoFilter；返回接续过来的命中数。
+
+        **同名规则要接着数。** 管理员通常在服务端运行中改配置、敲 `!!logfilter reload`，
+        从零开始数会把这一轮已经命中的次数抹掉——规则明明在工作，却被记成「零命中」。
+        只有真的从配置里删掉的规则，它的计数才该消失。
+        """
         with self._lock:
+            previous = {rule.pattern: rule.count for rule in self._rules if rule.count}
             self._rules = tuple(rules)
             self._log_matched_lines = log_matched_lines
-            self._total = 0
+            self._total = _carry_counts(self._rules, previous)
+            return self._total
 
     def reset_counters(self) -> None:
         with self._lock:
@@ -260,11 +278,23 @@ class ServerLogFilter(InfoFilter):
                 rule.count = 0
 
     def match(self, content: str) -> Optional[Rule]:
-        """返回第一条命中的规则，没有则返回 None。"""
+        """返回第一条命中的规则，没有则返回 None。
+
+        逐行热路径用它：一行只需要知道「该不该隐去」，找到第一条就可以停。
+        """
         for rule in self._rules:
             if rule.regex.search(content):
                 return rule
         return None
+
+    def matching_rules(self, content: str) -> List[Rule]:
+        """**所有**命中的规则。只给 `!!logfilter test` 用。
+
+        与 `match()` 分开是有意的：`test` 的价值在于告诉管理员「你写的规则里哪些真的生效了」，
+        只说第一条会让人以为其余几条没匹配上（于是去改本来写对的规则）。
+        热路径不受影响——那里仍然是遇到第一条就返回。
+        """
+        return [rule for rule in self._rules if rule.regex.search(content)]
 
     def filter_server_info(self, info) -> None:
         rules = self._rules
@@ -321,6 +351,28 @@ def _probe_pattern(regex: Pattern, budget_ms: int) -> Optional[Tuple[int, float]
     return None
 
 
+# 用来判断「这条规则是不是匹配一切」。刻意选得**差异极大**（字母/数字/标点/空白/中文），
+# 这样窄规则不可能全中；只有 `.` `.*` `^` `a?` `\w*` `.+` 这类才会全中。
+# 这类规则不会卡顿，但会让整个控制台变成一片空白——管理员会以为服务端挂了。
+CATCH_ALL_SUBJECTS = (
+    "a",
+    "0",
+    "ZZZ",
+    "--- !!! ???",
+    "   ",
+    "玩家加入了游戏",
+)
+
+
+def _matches_everything(regex) -> bool:
+    """这条规则是不是「随便什么行都命中」。
+
+    必须在``_probe_pattern``之后再调用：万一某个模式既宽又慢，
+    回溯探测会先把它拦下，不会走到这里。
+    """
+    return all(regex.search(subject) for subject in CATCH_ALL_SUBJECTS)
+
+
 def _build_rules(
     server: PluginServerInterface,
     patterns: List[str],
@@ -328,7 +380,7 @@ def _build_rules(
     probe_budget_ms: int = 25,
 ) -> List[Rule]:
     """编译规则；单条写错不影响其他规则，只在日志里报错或警告。"""
-    global _rejected_patterns
+    global _rejected_patterns, _warned_patterns, _duplicate_patterns
 
     # 预算 <= 0 会把**每一条**规则都判成「太慢」→ 过滤静默失效、报错还指向「回溯风险」
     # 这个错误的方向。夹到 1 ms：真实规则在微秒级、危险模式在百毫秒级，两边都分得清。
@@ -337,10 +389,21 @@ def _build_rules(
 
     rules: List[Rule] = []
     _rejected_patterns = []
+    _warned_patterns = []
+    _duplicate_patterns = []
+    seen = set()
     for raw in patterns:
         pattern = (raw or "").strip()
         if not pattern:
             continue
+        if pattern in seen:
+            # 同一条写两遍：第二条永远不会命中（match() 返回第一条），但 state.rules
+            # 以 pattern 为键——两条共享一份统计，第二条的 zero_streak 会一直涨，
+            # 最后弹出一条假的「从没命中过」。留一条、说出来，别让它悄悄污染统计。
+            server.logger.warning(_t("rule.duplicate", pattern=pattern))
+            _duplicate_patterns.append(pattern)
+            continue
+        seen.add(pattern)
         try:
             regex = re.compile(pattern)
         except (re.error, OverflowError, RecursionError) as error:
@@ -369,6 +432,11 @@ def _build_rules(
                 )
                 _rejected_patterns.append(pattern)
                 continue
+            if _matches_everything(regex):
+                # 只警告、不丢弃：把管理员亲手写的规则偷偷扔掉是另一种意外，
+                # 而这条警告已经把问题说清楚了（它出现在控制台，不受本插件影响）。
+                server.logger.warning(_t("rule.catch_all", pattern=pattern))
+                _warned_patterns.append(pattern)
         rules.append(Rule(pattern, regex))
     return rules
 
@@ -393,6 +461,8 @@ _language_setting: str = i18n.AUTO
 # 本次载入被跳过的规则（正则写错、或触发回溯保护），供 !!logfilter 说明
 # 「为什么启用的条数比配置里少」。
 _rejected_patterns: List[str] = []
+_warned_patterns: List[str] = []
+_duplicate_patterns: List[str] = []
 
 # 只有完成过启动的周期才计入「零命中」统计，否则连续启动失败会刷出假提醒。
 _session_reached_startup = False
@@ -862,10 +932,10 @@ def on_load(server: PluginServerInterface, prev_module) -> None:
     _log_summary(server, rules)
 
 
-def _apply_config(server: PluginServerInterface) -> Tuple[List[Rule], List[str]]:
+def _apply_config(server: PluginServerInterface) -> Tuple[List[Rule], List[str], int]:
     """重读配置并就地替换规则（不重新注册命令与过滤器）。
 
-    返回 ``(规则列表, 被清掉的旧规则统计)``。
+    返回 ``(规则列表, 被清掉的旧规则统计, 接续过来的命中数)``。
     """
     global _config
     _config = _load_config(server)
@@ -875,10 +945,11 @@ def _apply_config(server: PluginServerInterface) -> Tuple[List[Rule], List[str]]
         validate=_config.validate_patterns,
         probe_budget_ms=_config.pattern_probe_timeout_ms,
     )
+    carried = 0
     if _log_filter is not None:
-        _log_filter.reload_rules(rules, _config.log_matched_lines)
+        carried = _log_filter.reload_rules(rules, _config.log_matched_lines)
     pruned = [] if _state is None else _prune_state(server, _state, _config.patterns)
-    return rules, pruned
+    return rules, pruned, carried
 
 
 def on_server_start(server: PluginServerInterface) -> None:
@@ -1122,12 +1193,32 @@ def _show_status(source) -> None:
                     RText(_t("status.streak", streak=entry.zero_streak), RColor.gray)
                 )
 
+    if _warned_patterns:
+        parts.append("\n")
+        parts.append(
+            _field(
+                _t("status.warned_label"),
+                _t("status.warned", count=len(_warned_patterns)),
+                RColor.red,
+            )
+        )
+
     if _rejected_patterns:
         parts.append("\n")
         parts.append(
             _field(
                 _t("status.rejected_label"),
                 _t("status.rejected", count=len(_rejected_patterns)),
+                RColor.yellow,
+            )
+        )
+
+    if _duplicate_patterns:
+        parts.append("\n")
+        parts.append(
+            _field(
+                _t("status.duplicate_label"),
+                _t("status.duplicate", count=len(_duplicate_patterns)),
                 RColor.yellow,
             )
         )
@@ -1153,13 +1244,16 @@ def _reload(source) -> None:
     if _server is None:
         source.reply(RText(_t("cmd.not_initialised_reload"), RColor.red))
         return
-    rules, pruned = _apply_config(_server)
+    rules, pruned, carried = _apply_config(_server)
     _log_summary(_server, rules)
     _announce_pruned(_server, pruned)
     reply = RTextList(
         RText(_t("reload.done"), RColor.green),
         RText(_t("reload.count", count=len(rules)), RColor.gray),
     )
+    if carried:
+        # 让管理员看见「这一轮的计数没有丢」，否则他会以为重载把统计清了
+        reply.append(RText(_t("reload.carried_session", count=carried), RColor.gray))
     if pruned:
         reply.append(RText(_t("reload.pruned", count=len(pruned)), RColor.gray))
     source.reply(reply)
@@ -1201,18 +1295,19 @@ def _test_line(source, context) -> None:
 
     text = context["text"]
     body = _LOG_LINE_PREFIX.sub("", text, count=1) or text
-    rule = _log_filter.match(body)
+    matched = _log_filter.matching_rules(body)
 
-    if rule is None:
+    if not matched:
         reply = RTextList(
             RText(_t("test.miss"), RColor.green),
             RText(_t("test.miss_detail"), RColor.gray),
         )
     else:
+        # 全部列出来：只报第一条会让人以为其余几条没匹配上
         reply = RTextList(
             RText(_t("test.hit"), RColor.yellow),
             RText(_t("test.hit_detail"), RColor.gray),
-            RText(rule.pattern, RColor.white),
+            RText(", ".join(rule.pattern for rule in matched), RColor.white),
         )
     if body != text:
         reply.append("\n")

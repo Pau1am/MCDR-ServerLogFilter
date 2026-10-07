@@ -25,7 +25,6 @@ REPO = Path(__file__).resolve().parent.parent
 SRC = "server_log_filter/__init__.py"
 I18N = "server_log_filter/i18n.py"
 LANG_ZH = "server_log_filter/lang/zh_cn.json"
-LANG_EN = "server_log_filter/lang/en_us.json"
 PACK = "pack.py"
 
 WARN_BLOCK = """    if (
@@ -127,7 +126,6 @@ QUARANTINE_CALL = (
     "    _config_was_reset = _quarantine_broken_config(server, CONFIG_FILE_NAME, data) is not None\n"
 )
 
-DOC_SUFFIX_LINE = '            suffix = "   （已连续 {} 次零命中）".format(entry.zero_streak)\n'
 DOC_SUFFIX_GUARD = "        if entry.zero_streak > threshold:\n"
 
 def drop_quarantine_call(src):
@@ -411,8 +409,8 @@ def always_pad_the_rule_index(src):
 def ship_the_code_with_its_comments(src):
     """打包时不再剥注释 —— 包又变回「仓库什么样就发什么样」。"""
     return src.replace(
-        "                zf.writestr(rel, packaged_source(path))\n",
-        "                zf.writestr(rel, path.read_bytes())  # mutation\n",
+        "                data = packaged_source(path)\n",
+        "                data = path.read_bytes()  # mutation\n",
     )
 
 
@@ -421,6 +419,54 @@ def strip_without_keeping_line_numbers(src):
     return src.replace(
         "            lines[row - 1] = line[:col].rstrip() + newline\n",
         '            lines[row - 1] = ""  # mutation: shift line numbers\n',
+    )
+
+
+def zero_the_counts_on_a_command_reload(src):
+    """命令重载又回到「计数清零」—— 本轮已命中的次数被抹掉。"""
+    return src.replace(
+        "            self._total = _carry_counts(self._rules, previous)\n",
+        "            self._total = 0  # mutation\n",
+    )
+
+
+def report_only_the_first_matching_rule(src):
+    """`test` 又只报第一条命中规则。"""
+    return src.replace(
+        "        return [rule for rule in self._rules if rule.regex.search(content)]\n",
+        "        first = self.match(content)\n"
+        "        return [first] if first else []  # mutation\n",
+    )
+
+
+def drop_the_catch_all_guard(src):
+    """去掉「匹配一切」守卫 —— 一个字符的打错又能静音整个控制台且毫无提示。"""
+    return src.replace(
+        "            if _matches_everything(regex):\n",
+        "            if False:  # mutation\n",
+    )
+
+
+def stop_deduplicating_rules(src):
+    """不再去重 —— 同一条规则写两次又会互相污染统计。"""
+    return src.replace(
+        "            _duplicate_patterns.append(pattern)\n"
+        "            continue\n",
+        "            pass  # mutation\n",
+    )
+
+
+def let_the_timestamp_follow_the_file_mtime(src):
+    """时间戳回到文件 mtime —— 包不再可复现。
+
+    别写成 ``ZipInfo(rel)``：它的**默认** date_time 恰好就是 1980-01-01，
+    与固定常量相同，于是这个变异不改变任何行为、测试永远抓不到（犯过一次）。
+    """
+    return src.replace(
+        "            info = zipfile.ZipInfo(rel, date_time=FIXED_ZIP_TIMESTAMP)\n",
+        "            info = zipfile.ZipInfo(\n"
+        "                rel, date_time=zipfile.ZipInfo.from_file(path).date_time\n"
+        "            )  # mutation: follow the file mtime\n",
     )
 
 
@@ -521,6 +567,17 @@ MUTATIONS = [
      ["tests/test_plugin.py", "-k", "carries_no_comments"]),
     ("stripping that shifts line numbers", PACK, strip_without_keeping_line_numbers,
      ["tests/test_plugin.py", "-k", "keeps_line_numbers"]),
+    ("counts zeroed on a command reload", SRC, zero_the_counts_on_a_command_reload,
+     ["tests/test_plugin.py", "-k", "does_not_fake_an_idle_session or counts_of_rules_that_survive"]),
+    ("only the first matching rule reported", SRC, report_only_the_first_matching_rule,
+     ["tests/test_plugin.py", "-k", "lists_every_matching_rule"]),
+    ("the catch-all guard dropped", SRC, drop_the_catch_all_guard,
+     ["tests/test_plugin.py", "-k", "hides_everything or catch_all_rule_is_kept or says_which_rule"]),
+    ("rule de-duplication removed", SRC, stop_deduplicating_rules,
+     ["tests/test_plugin.py", "-k", "written_twice or poison_the_statistics or order_of_first_appearance"]),
+    ("the zip timestamp follows the file mtime", PACK,
+     let_the_timestamp_follow_the_file_mtime,
+     ["tests/test_plugin.py", "-k", "identical_bytes or pinned_timestamp"]),
 ]
 
 def pytest_ok(workdir, selector):
@@ -538,6 +595,13 @@ def pytest_ok(workdir, selector):
     return proc.returncode, summary
 
 def main():
+    # 至少有一条变异只有端到端测试能抓住（``arrives_after``）。跳过 e2e 的话，
+    # 那些用例会被 pytest skip → 退出码 0 → 变异被误判成 SURVIVED，
+    # 于是这个工具开始报假警。宁可直接拒绝运行。
+    if os.environ.get("MCDR_SKIP_E2E"):
+        print("MCDR_SKIP_E2E is set: the end-to-end suite would be skipped, and at least one")
+        print("mutation is only caught there. Unset it and run again.")
+        return 2
     if not (REPO / ".testlibs").is_dir():
         print("run the tests/README.md setup first (.testlibs is missing)")
         return 1
@@ -568,12 +632,22 @@ def main():
     print()
 
     killed = 0
+    broken = []           # 锚点失效的变异：是脚本自己过期了，不是测试没抓住
     for name, relative, mutate, selector in MUTATIONS:
         baseline = baselines[relative]
         mutated = mutate(baseline)
         if mutated == baseline:
+            broken.append(name)
             print("  !! {}: mutation did not apply (anchor moved?)".format(name))
             continue
+        if relative.endswith(".py"):
+            try:
+                compile(mutated, relative, "exec")
+            except SyntaxError as error:
+                broken.append(name)
+                print("  !! {:<52} mutated code does not compile: line {}".format(
+                    name, error.lineno))
+                continue
         (repo / relative).write_text(mutated, encoding="utf-8")
         code, summary = pytest_ok(repo, selector)
         (repo / relative).write_text(baseline, encoding="utf-8")
@@ -589,8 +663,16 @@ def main():
     print()
     print("caught {}/{}".format(killed, len(MUTATIONS)))
     shutil.rmtree(workdir, ignore_errors=True)
-    if killed != len(MUTATIONS):
-        print("some mutations survived — the corresponding tests are decorative")
+    # 「锚点失效」跟「测试没抓住」是两回事：前者是脚本自己过期了（多半是重构挪走了那一行），
+    # 后者才是测试的问题。但两种都必须失败退出 —— 一个失效的锚点等于少测一项。
+    survived = len(MUTATIONS) - killed - len(broken)
+    if broken:
+        print("{} mutation(s) could not be applied — the anchors are stale:".format(len(broken)))
+        for name in broken:
+            print("   - {}".format(name))
+    if survived:
+        print("{} mutation(s) survived — the corresponding tests are decorative".format(survived))
+    if broken or survived:
         return 1
     print("every mutation was caught — the tests have teeth")
     return 0

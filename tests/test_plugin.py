@@ -37,11 +37,23 @@ import server_log_filter as slf
 from server_log_filter import i18n
 
 
-class _SelfMetadata:
-    """The slice of plugin metadata the help title reads."""
+_PLUGIN_META = json.loads(
+    (pathlib.Path(__file__).resolve().parent.parent / "mcdreforged.plugin.json").read_text(
+        encoding="utf-8")
+)
 
-    name = "Server Log Filter"
-    version = "1.4.0"
+
+class _SelfMetadata:
+    """The slice of plugin metadata the help title reads.
+
+    Read from the real ``mcdreforged.plugin.json`` rather than hardcoded: a literal drifts
+    the moment the version is bumped, and then the title-bar test passes against the stale
+    value instead of the shipped one. (It had: the fake said 1.4.0 while the metadata said
+    1.4.1.)
+    """
+
+    name = _PLUGIN_META["name"]
+    version = _PLUGIN_META["version"]
 from mcdreforged.api.types import PermissionLevel
 
 
@@ -344,16 +356,31 @@ def test_unmatched_lines_do_not_increment_counters():
     assert f.total == 0
 
 
-def test_reload_replaces_rules_and_zeroes_counters():
+def test_reload_swaps_the_rules_and_drops_removed_ones():
+    """规则被换掉后：删掉的规则计数归零，留下的规则接着数（见下面那两条）。"""
     f = make_filter(["alpha"])
     f.filter_server_info(FakeInfo("alpha"))
     assert f.total == 1
-    new_rules = [slf.Rule("gamma")]
-    f.reload_rules(new_rules, False)
+
+    f.reload_rules([slf.Rule("gamma")], False)
+
     assert f.rules[0].pattern == "gamma"
-    assert f.total == 0
+    assert f.total == 0, "被删掉的规则不该把它的计数留给别人"
     assert f.match("alpha") is None
     assert f.match("gamma") is not None
+
+
+def test_a_reload_keeps_the_counts_of_rules_that_survive():
+    """同一轮的计数必须接着数，否则周期会被切成两段。"""
+    f = make_filter(["alpha", "beta"])
+    for _ in range(5):
+        f.filter_server_info(FakeInfo("alpha"))
+    f.filter_server_info(FakeInfo("beta"))
+
+    f.reload_rules([slf.Rule("alpha"), slf.Rule("beta"), slf.Rule("gamma")], False)
+
+    assert [r.count for r in f.rules] == [5, 1, 0], [r.count for r in f.rules]
+    assert f.total == 6, "本次已隐去不该被重载清零"
 
 
 def test_reset_counters_zeroes_total_and_each_rule():
@@ -2565,7 +2592,7 @@ def test_the_title_bar_names_the_plugin_and_the_version():
     assert plain.startswith("====="), plain
     assert plain.endswith("====="), plain
     assert "Server Log Filter" in plain, plain
-    assert " v" in plain and "1.4" in plain, "版本号要出现: {}".format(plain)
+    assert "v" + _PLUGIN_META["version"] in plain, "要出现真实版本号: {}".format(plain)
     # 大约一行宽（MC 聊天默认字体）
     assert 44 <= len(plain) <= 60, "顶栏宽度 {} 列不像一行: {!r}".format(len(plain), plain)
 
@@ -2807,3 +2834,202 @@ def test_a_docstring_only_body_becomes_pass_and_still_compiles():
     assert "only a docstring" not in stripped, stripped
     compile(stripped, "<stripped>", "exec")
     assert "pass" in stripped.split("def g")[0], stripped
+
+
+def test_the_reload_command_does_not_fake_an_idle_session():
+    """实机流程：服务端运行中改配置、敲 reload、然后服务端停止。
+
+    这是管理员最常走的路径（README 也是这么推荐的）。重载若把计数清零，
+    这一轮明明命中过的规则会被写进 state 成「零命中」，连续零命中计数跟着涨，
+    最后弹出那条假的「这条规则从没命中过」提醒。
+    """
+    pattern = "joined the game"
+    server = start_plugin(config={"patterns": [pattern], "stale_rule_threshold": 1})
+    slf.on_server_startup(server)
+
+    for _ in range(5):
+        slf._log_filter.filter_server_info(FakeInfo("Player Steve " + pattern))
+
+    source = FakeSource()
+    slf._reload(source)
+
+    assert slf._log_filter.rules[0].count == 5, "重载后计数不该归零"
+    assert slf._log_filter.total == 5, "本次已隐去不该被重载清零"
+    assert "继续保留" in "".join(str(x) for x in source.replies), "要告诉管理员计数没丢"
+
+    slf.on_server_stop(server, 0)
+
+    entry = slf._state.rules[pattern]
+    assert entry.hits_last_session == 5, "写进 state 的必须是真实命中数"
+    assert entry.zero_streak == 0, "这条规则命中了，连续零命中计数不该涨"
+
+
+def test_the_reload_command_still_forgets_a_deleted_rules_counts():
+    """另一半：真从配置里删掉的规则，计数就该消失。"""
+    server = start_plugin(config={"patterns": ["gone", "kept"]})
+    slf.on_server_startup(server)
+    for _ in range(3):
+        slf._log_filter.filter_server_info(FakeInfo("gone"))
+    slf._log_filter.filter_server_info(FakeInfo("kept"))
+
+    server.config_data = {"patterns": ["kept"]}   # 管理员把 gone 删了
+    slf._reload(FakeSource())
+
+    assert [r.pattern for r in slf._log_filter.rules] == ["kept"]
+    assert slf._log_filter.rules[0].count == 1, "留下的规则要接着数"
+    assert slf._log_filter.total == 1, "被删掉的规则不该把计数留下来"
+
+
+def test_the_test_command_lists_every_matching_rule():
+    """只报第一条，管理员会以为另外几条没匹配上，然后去改本来写对的规则。"""
+    start_plugin(config={"patterns": ["joined", "the game", "Steve"]})
+
+    source = FakeSource()
+    slf._test_line(source, {"text": "Player Steve joined the game"})
+    text = "".join(str(x) for x in source.replies)
+
+    for pattern in ("joined", "the game", "Steve"):
+        assert pattern in text, "{} 也要报出来: {}".format(pattern, text)
+
+
+# ---------------------------------------------------------------------------
+#  匹配一切的规则：警告但保留
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("pattern", [".", ".*", "^", "a?", "\\w*", ".+", ".{0,}"])
+def test_a_pattern_that_hides_everything_is_flagged(pattern):
+    """这些规则会把整个控制台变成空白，管理员会以为服务端挂了。"""
+    assert slf._matches_everything(re.compile(pattern)), pattern
+
+
+@pytest.mark.parametrize("pattern", [
+    LIVE, IDLE, "\\w", "\\d+", "joined the game", "^\\[", "error|warn", "玩家",
+])
+def test_normal_patterns_are_not_flagged(pattern):
+    """窄规则不可能命中所有探测串——误报会让警告变得不值得看。"""
+    assert not slf._matches_everything(re.compile(pattern)), pattern
+
+
+def test_a_catch_all_rule_is_kept_but_warned():
+    """警告，但规则仍然生效：偷偷丢掉管理员写的规则是另一种意外。"""
+    server = start_plugin(config={"patterns": [".", LIVE]})
+    logger = server.logger
+
+    assert len(slf._log_filter.rules) == 2, "规则要保留（不是被拒）"
+    assert slf._warned_patterns == ["."], slf._warned_patterns
+    assert slf._rejected_patterns == [], "这不是「被拒绝」，是「被警告」"
+    assert any("匹配一切" in w for w in logger.warnings), logger.warnings
+
+    # 确实仍然生效
+    info = FakeInfo("Player Steve joined the game")
+    slf._log_filter.filter_server_info(info)
+    assert info.action_flag is not None
+
+
+def test_the_status_screen_says_which_rule_hides_everything():
+    start_plugin(config={"patterns": [".", LIVE]})
+    source = FakeSource()
+    slf._show_status(source)
+    text = str(source.replies[0])
+
+    assert "匹配一切" in text, text
+    assert ". / .* / ^" in text, text          # 顺带给出常见写法错误
+    assert "已跳过" not in text, "它不是被跳过的规则"
+
+
+def test_a_catch_all_warning_is_not_mistaken_for_a_backtracking_rejection():
+    """两条守卫职责不同，别混成一个桶：回溯是「会卡」，匹配一切是「会静音」。"""
+    server = start_plugin(config={"patterns": [".", "(a+)+$"]})
+    del server
+
+    assert slf._warned_patterns == ["."], slf._warned_patterns
+    assert slf._rejected_patterns == ["(a+)+$"], slf._rejected_patterns
+
+
+# ---------------------------------------------------------------------------
+#  重复规则
+# ---------------------------------------------------------------------------
+
+def test_the_same_rule_written_twice_becomes_one():
+    server = start_plugin(config={"patterns": [LIVE, LIVE]})
+    del server
+
+    assert len(slf._log_filter.rules) == 1, "同一条写两次只该留一条"
+    assert slf._duplicate_patterns == [LIVE], slf._duplicate_patterns
+
+
+def test_a_duplicate_is_reported_and_does_not_poison_the_statistics():
+    """重复的那条永远 0 命中，却和第一条共用 state 条目——会喂出假的「从没命中过」。"""
+    server = start_plugin(config={"patterns": [LIVE, LIVE], "stale_rule_threshold": 1})
+    assert any("重复" in w for w in server.logger.warnings), server.logger.warnings
+
+    source = FakeSource()
+    slf._show_status(source)
+    text = str(source.replies[0])
+    assert "重复" in text, text
+
+    # 真的命中之后，这一轮不该被判成零命中
+    slf.on_server_startup(server)
+    for _ in range(3):
+        slf._log_filter.filter_server_info(FakeInfo("Player Steve " + LIVE))
+    slf.on_server_stop(server, 0)
+
+    entry = slf._state.rules[LIVE]
+    assert entry.hits_last_session == 3, entry.hits_last_session
+    assert entry.zero_streak == 0, "命中了就不该涨零命中计数"
+
+
+def test_deduplication_keeps_the_order_of_first_appearance():
+    server = start_plugin(config={"patterns": ["b", "a", "b", "a", "c"]})
+    del server
+    assert [r.pattern for r in slf._log_filter.rules] == ["b", "a", "c"]
+
+
+# ---------------------------------------------------------------------------
+#  18. 打包可复现
+# ---------------------------------------------------------------------------
+
+def test_packing_the_same_source_twice_gives_identical_bytes(tmp_path):
+    """同样源码必须打出同样字节，否则用户无法「重建后比对 sha256」来验证发布资产。"""
+    import pack
+
+    first = tmp_path / "first.mcdr"
+    second = tmp_path / "second.mcdr"
+    pack.build(first)
+
+    # 让所有源文件的 mtime 都变一下：旧实现会因此改变 zip 里的时间戳
+    import os
+    import time
+
+    now = time.time()
+    for path in pack.collect():
+        os.utime(path, (now, now))
+
+    pack.build(second)
+
+    assert first.read_bytes() == second.read_bytes(), "两次打包的字节不同"
+    assert first.stat().st_size == second.stat().st_size
+
+
+def test_every_member_carries_the_pinned_timestamp(tmp_path):
+    """不是「恰好两次一样」，而是每个成员都用同一个常量时间戳。"""
+    import pack
+
+    out, names = _build_package(tmp_path)
+    with zipfile.ZipFile(out) as zf:
+        stamps = {i.date_time for i in zf.infolist()}
+    assert stamps == {pack.FIXED_ZIP_TIMESTAMP}, stamps
+    assert len(names) == 7
+
+
+def test_the_changelog_has_no_duplicate_headings():
+    """同一层的小节标题不该出现两次。
+
+    这条是给「脚本反复编辑 CHANGELOG」这个流程兜底的：两次编辑各插了一个
+    ``### 开发``，文件看起来仍然合法，人眼容易漏。（本项目已犯过一次。）
+    """
+    text = (pathlib.Path(__file__).resolve().parent.parent / "CHANGELOG.md").read_text(
+        encoding="utf-8")
+    headings = [line.strip() for line in text.splitlines() if line.startswith("#")]
+    duplicates = {h for h in headings if headings.count(h) > 1}
+    assert not duplicates, "CHANGELOG 里有重复标题: {}".format(sorted(duplicates))

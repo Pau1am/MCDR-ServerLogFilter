@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    name: unit tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install test dependencies
+        run: python -m pip install --target .testlibs -r tests/requirements-test.txt
+      - name: Run the suite (real-MCDR end-to-end excluded here)
+        env:
+          MCDR_SKIP_E2E: "1"
+        run: PYTHONPATH=.testlibs python -m pytest tests -q
+
+  mutation:
+    name: mutation check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install test dependencies
+        run: python -m pip install --target .testlibs -r tests/requirements-test.txt
+      # No MCDR_SKIP_E2E here: the tool needs the end-to-end suite (see its main()).
+      - name: Every mutation must be caught by at least one test
+        run: python tools/mutation_check.py
+
+  e2e:
+    name: end-to-end (real MCDR)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install test dependencies
+        run: python -m pip install --target .testlibs -r tests/requirements-test.txt
+      - name: Run the end-to-end suite
+        run: PYTHONPATH=.testlibs python -m pytest tests/test_e2e.py -q
+      - name: Upload the MCDR console log when it fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: /tmp/pytest-of-*/**
+          if-no-files-found: ignore

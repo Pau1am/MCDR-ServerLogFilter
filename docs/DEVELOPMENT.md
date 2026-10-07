@@ -93,6 +93,23 @@ open(os.path.join(os.path.dirname(__file__), ...))   # 仅作为解包运行的�
 `tools/mutation_check.py` 的 `skip_the_catalogues` 变异把 `pkgutil.get_data` 换成
 `data = None`，确认测试会因此变红。
 
+## 持续集成
+
+`.github/workflows/ci.yml` 跑三个 job，对应上面三条命令：
+
+| job | 内容 | 为什么要分开 |
+|---|---|---|
+| `unit` | `MCDR_SKIP_E2E=1 pytest tests`，Python 3.10 / 3.13 | 快（约 40 s），两个 Python 版本都验一验语法与行为 |
+| `mutation` | `python tools/mutation_check.py` | 约 4 分钟，且**会改写源码再还原** —— 不能和别的 job 共用工作区 |
+| `e2e` | `pytest tests/test_e2e.py`（真实 MCDR） | 最慢、最依赖环境；失败时上传日志便于排查 |
+
+⛔ **`mutation` job 不能设 `MCDR_SKIP_E2E`**：至少有一条变异（`arrives_after`）
+只有端到端测试能抓住，跳过 e2e 会让它被 pytest skip → 退出码 0 → 被误报成「测试没抓住」。
+`tools/mutation_check.py` 自己会拒绝在这种环境下运行，比指望 CI 配置写对可靠。
+
+> 跨版本矩阵（`tools/mcdr_matrix.py`）**不在 CI 里**：它需要三个各自装了不同 MCDR 的
+> Python 环境，在 runner 上重建不划算。发版前本地跑。
+
 ## 包体积：打包时剥掉注释与 docstring
 
 **仓库保留注释，包不保留。** `pack.py` 在建包时把每个 `.py` 的注释与 docstring 清空
@@ -132,6 +149,23 @@ open(os.path.join(os.path.dirname(__file__), ...))   # 仅作为解包运行的�
 | 只发 `.pyc` | — | ⛔ 与 Python 版本绑定，MCDR 支持多版本 → 直接不可用 |
 | 删 LANGUAGE / LICENSE | 627 B | 随包分发是 MIT 的常规做法，且用户明确要求保留 |
 
+
+## 打包是可复现的
+
+**同样的源码永远打出同样的字节。** 每个 zip 成员都通过手工构造的 `ZipInfo` 写入，
+时间戳固定为 `FIXED_ZIP_TIMESTAMP`（1980-01-01，zip 能存的最早时间），
+权限位固定 `0644`，宿主系统固定 unix。
+
+为什么值得多这几行：早期版本直接 `zf.write()`，zip 条目记录的是**文件 mtime**，
+于是同一天改一次文件、或者换台机器打包，就会得到不同的 sha256。
+**这会让「拿源码按 tag 重建、比对发布资产的哈希」这条路彻底走不通** ——
+用户只能确认下载没损坏，无法确认这个包确实来自那份源码。
+
+⚠️ 所以：**发布时正文里写的 sha256，必须来自实际要上传的那个文件**，
+而验证方式就是 `python pack.py && sha256sum`。
+
+> 另外注意：`.py` 成员在打包时会被剥掉注释与 docstring（见上一节），
+> 所以比对产物不能直接和仓库文件比字节，要和 `packaged_source()` 比。
 
 ## 自行打包
 
@@ -216,18 +250,18 @@ PYTHONPATH=.testlibs python -m pytest tests -v     # Windows: $env:PYTHONPATH=".
 > 出问题就在那一轮集中修，修完再提 PR。这样既避免反复烧时间，又保证合并前是完整的证据。
 > 汇报时说清「哪些跑过、哪些没跑」，不要用「全绿」掩盖没跑的部分。
 
-当前 **263 个用例**，分三层：
+当前 **290 个用例**，分三层：
 
 | 层 | 位置 | 说明 |
 |---|---|---|
-| 单元 | `tests/test_plugin.py` | 过滤逻辑、配置对象、命令面、打包、迁移、坏配置保全、语言、命令面与权限与界面与打包（226 条） |
+| 单元 | `tests/test_plugin.py` | 过滤逻辑、配置对象、命令面与权限、界面、打包、迁移、坏配置保全、语言、重载与计数（253 条） |
 | 端到端 | `tests/test_e2e.py` | 启动**真实 MCDR**，加载 `pack.py` 产出的 `.mcdr`，用假服务端跑完整生命周期（37 条） |
 | 跨版本 | `tools/mcdr_matrix.py` | 同一个包在多个 MCDR 版本上逐项核对 |
 
 另有两个工具：
 
 ```bash
-python tools/mutation_check.py    # 故意改坏实现，确认测试会变红（46 个变异，46/46 应被抓住）
+python tools/mutation_check.py    # 故意改坏实现，确认测试会变红（51 个变异，51/51 应被抓住）
 python benchmarks/bench_filter.py # 性能基准，README / CHANGELOG 里引用的数字都由它产出
 python benchmarks/bench_versions.py 旧.mcdr 新.mcdr   # 两个版本逐项对比，见「版本间性能对比」
 ```
@@ -263,7 +297,7 @@ python tools/mcdr_matrix.py --current
   死亡消息、`Saving and pausing game...`
 - `content` 为 `""` / `None` / 纯空白时不崩溃
 - 换玩家名同样命中
-- 多规则各自独立计数；`reload` 后计数归零
+- 多规则各自独立计数；`reload` **接续同名规则的计数**（被删掉的规则才丢计数）
 - 非法正则被跳过且产生警告，不影响其他规则
 - 近乎相同但不同的行**不**命中（证明不是无脑全过滤）
 - **零命中提醒**：达阈值才提醒、命中即归零、启动失败的周期不计入、热重载不误判、
@@ -373,7 +407,45 @@ python tools/mcdr_matrix.py --current
 （别用 `_execute_command`：MCDR 在那里只是**收集**执行项、稍后才真正调用，
 所以「没抛异常」并不代表命令会被执行——这一点最初的测试就写错了一次。）
 
-### 两个界面的排版：宽度、对齐、配色
+### 两条「规则写得不对」的守卫（职责不同，别混成一个桶）
+
+加载时两道检查，顺序不能换：
+
+1. **灾难性回溯**（早就有）：短探测串上超时就**拒绝**该规则。它会让 MCDR 主线程卡顿。
+2. **匹配一切**（1.4.1 新增）：用一组差异极大的探测串（`a` / `0` / `ZZZ` / `--- !!! ???` /
+   三个空格 / `玩家加入了游戏`）判断它是否命中所有非空行，命中就**警告但保留**。
+   `.`、`.*`、`^`、`a?`、`\w*`、`.+` 都会隐去每一行，控制台一片空白，管理员会以为服务端挂了。
+
+两处刻意的取舍：
+
+- **只警告、不丢弃**。把管理员亲手写的规则悄悄扔掉是另一种意外，而这条警告出现在控制台
+  （插件的 `logger.*` 不走信息过滤器，见「MCDR 内省要点」），一定能被看见。
+- **警告要落在状态页上**，不能只写日志。管理员是在「控制台看着不对」的时候才去敲
+  `!!logfilter list` 的，那时日志早就滚过去了。
+
+第三道（1.4.1 新增）不是检查而是**去重**：同一条规则写两遍时，第二条永远不可能命中
+（`match()` 返回第一条），但统计文件以规则文本为键、两条共享一份记录，
+于是第二条的 `zero_streak` 一直涨，又是一个假提醒。
+
+### 一次开服周期不能在重载处被切断
+
+「本次已隐去」是**按开服周期**结算的：服务端停止时写进 `state.json`，据此推进
+「连续零命中」。所以任何在本轮中途替换规则对象的操作，都必须把**同名规则**的计数接过来，
+否则这一轮会被切成两段，规则会被记成「零命中」。
+
+两条重载路径都得做，而且必须用同一个实现（`_carry_counts`）：
+
+| 路径 | 入口 |
+|---|---|
+| 插件重载 | `on_load` → `carry_over_from(prev_module._log_filter)` |
+| 命令重载 | `!!logfilter reload` → `_apply_config` → `reload_rules` |
+
+⛔ 1.4.1 之前只有前者做了。后者把计数清零，于是「改配置 → reload」这个 README 推荐的日常流程
+会伪造出零命中提醒。**修的时候注意现有测试：`test_reload_replaces_rules_and_zeroes_counters`
+当时用的是「规则被完全换掉」的场景，那里归零本来就无害，所以它没能暴露这个洞** ——
+补的是「规则保留时应接续」这一半。
+
+### 帮助页的排版：宽度、对齐、配色
 
 三条硬性要求，都是用户提的，各自有测试钉住：
 
@@ -733,8 +805,8 @@ Minecraft 侧：过滤发生在 MCDR 侧（对服务端 stdout 逐行匹配）�
 
 0. **提 PR 前统一跑一次完整清单**（开发过程中只跑相关子集）：
    ```bash
-   PYTHONPATH=.testlibs python -m pytest tests -q      # 全量 263
-   python tools/mutation_check.py                      # 46/46
+   PYTHONPATH=.testlibs python -m pytest tests -q      # 全量 288
+   python tools/mutation_check.py                      # 50/50
    python tools/mcdr_matrix.py <mcdr2150> <mcdr215> <mcdr216>   # 跨版本矩阵
    ```
    出现问题就在这一轮集中修，修完再提 PR。**矩阵不通过就不发版。**
