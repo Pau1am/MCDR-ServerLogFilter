@@ -22,8 +22,6 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
-
 # The child talks to us over stdout; keep it dependency-free and self-contained.
 CHILD = r'''
 import json, sys, time

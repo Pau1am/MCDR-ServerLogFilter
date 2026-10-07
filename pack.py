@@ -42,6 +42,13 @@ from pathlib import Path
 
 SRC = Path(__file__).resolve().parent
 
+# Zip entries carry a timestamp. Taking it from the file's mtime makes the artifact
+# unreproducible: packing the same source twice gives two different hashes, so nobody
+# can verify a release by rebuilding it from the tag and comparing sha256.
+# 1980-01-01 00:00 is the earliest date a zip can store, and the usual choice for
+# "this timestamp carries no information".
+FIXED_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
+
 # Root-level files that ship with the plugin.
 #
 # README.md / README_en.md are intentionally absent: MCDR never reads them, they
@@ -195,9 +202,17 @@ def build(out_path: Path) -> Path:
             if path.suffix == ".py":
                 # Comments stay in the repository, where they are useful to read;
                 # the artifact only needs the code.
-                zf.writestr(rel, packaged_source(path))
+                data = packaged_source(path)
             else:
-                zf.write(path, rel)
+                data = path.read_bytes()
+            # Hand-built ZipInfo rather than zf.write(): mtime, permission bits and host
+            # system all have to be pinned, or the same source packs into different bytes
+            # on a different day (or a different OS).
+            info = zipfile.ZipInfo(rel, date_time=FIXED_ZIP_TIMESTAMP)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.create_system = 3              # unix
+            info.external_attr = 0o644 << 16    # regular file, rw-r--r--
+            zf.writestr(info, data)
     return out_path
 
 

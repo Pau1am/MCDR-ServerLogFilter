@@ -1,6 +1,6 @@
 # 测试 / Tests
 
-本目录是 Server Log Filter 的测试套件。**263 个用例**，覆盖过滤行为、配置、
+本目录是 Server Log Filter 的测试套件。**290 个用例**，覆盖过滤行为、配置、
 命令面、发布打包、**真实 MCDR 端到端**、**多语言**，以及本插件最核心的安全属性
 （被隐去的行仍保留 `process`，事件照常分发）。
 
@@ -31,10 +31,16 @@ PYTHONPATH=.testlibs python -m pytest tests -v
 $env:PYTHONPATH=".testlibs"; python -m pytest tests -v
 ```
 
+CI（`.github/workflows/ci.yml`）跑的就是同一批命令：`unit`（跳过端到端，Python 3.10 / 3.13）、
+`mutation`、`e2e` 三个 job。跨版本矩阵不在 CI 里（需要三个各装了不同 MCDR 的环境），发版前本地跑。
+
+⛔ **`python tools/mutation_check.py` 不接受 `MCDR_SKIP_E2E`**：有一条变异只有端到端测试能抓住，
+跳过 e2e 会让它被 pytest skip → 退出码 0 → 被误报成「测试没抓住」。脚本会直接拒绝运行并说明原因。
+
 预期输出结尾：
 
 ```
-263 passed
+290 passed
 ```
 
 > **开发中不用每次都跑全量。** 改哪一块就只跑那一块，确认当前版本能过即可，例如
@@ -44,11 +50,13 @@ $env:PYTHONPATH=".testlibs"; python -m pytest tests -v
 
 ## 覆盖内容
 
-| 分组 | 用例数 | 说明 |
+**分组之间会重叠**（一条用例可能同时落在多组），所以各组数字**不要相加**；总数以 `pytest` 的实际输出为准（当前见下）。
+
+| 分组 | 约 | 说明 |
 |---|---|---|
 | 过滤行为与安全属性 | 30 | 目标刷屏行命中（3）；15 类关键行逐一验证**不**被误伤；`content` 为 `""`/`None`/纯空白不崩溃（5）；`hidden()` 保留 `process` 且绝不等于 `discarded()` |
 | 规则编译与容错 | 4 | 非法正则被跳过并告警，其余规则照常工作；空/空白规则静默丢弃 |
-| 计数、重载与重置 | 7 | 多规则独立计数；`reload` 后归零；首条命中规则胜出且只计一次 |
+| 计数、重载与重置 | 13 | 多规则独立计数；**`reload` 接续同名规则的计数**（旧版会归零，那是 1.4.1 修掉的 bug）；被删掉的规则才丢计数；首条命中规则胜出且只计一次 |
 | 配置对象 | 3 | 默认值与 README 文档一致；JSON 反序列化；往返稳定 |
 | MCDR 契约 | 2 | `InfoActionFlag.hidden()` 的常量构成；`InfoFilter` 允许改写 `action_flag` |
 | 命令面与元数据 | 8 | `on_load` 注册项；状态/测试/重载命令输出；`reload` 的 ADMIN 权限门禁；插件元数据与 `MIN_MCDR_VERSION` 同步 |
@@ -60,10 +68,11 @@ $env:PYTHONPATH=".testlibs"; python -m pytest tests -v
 | **坏配置的保全与重建** | **13** | 见下 |
 | **写坏提示的开关** | **11** | 开关从**写坏的原文**里读取（大小写 / 空格 / 位置随意、同名后缀不算、找不到按默认开启）；被静默的只有消息，备份照做；「连备份都失败」不受开关影响 |
 | **语言（i18n）** | **29** | 见下；`auto` 双向跟随、显式值压过 MCDR、宽松识别、未知语言回落、坏目录不崩、**打包后仍读得到文案**、英文真的到达每一处输出，外加一整套目录结构不变式 |
-| **命令面、权限、界面与打包** | **47** | `!!lf` 别名（一个节点两条字面量）、帮助页、`help`/`list` 的接线，以及 4 条在**真 MCDR** 上真的敲一遍命令的端到端 |
+| **命令面、权限、界面与打包** | **49** | `!!lf` 别名（一个节点两条字面量）、帮助页、`help`/`list` 的接线，以及 4 条在**真 MCDR** 上真的敲一遍命令的端到端 |
+| **1.4.1 的修复与守卫** | **25** | 命令重载接续计数（3）、`test` 列出全部命中（1）、匹配一切的规则被警告但保留（11，含 7 条参数化）、重复规则去重（3）、以及对应的接线 |
 | **1.3.0 的修复** | **9** | 非 UTF-8 配置被备份而非致命（2）、`test` 剥掉控制台前缀（2）、状态里显示语言来源与被跳过的规则（2）、量化符溢出与深层嵌套不再致命（2）、坏模板的 `AttributeError`（1） |
-| **端到端（真实 MCDR）** | **33** | 见下 |
-| **合计** | **263** | |
+| **端到端（真实 MCDR）** | **37** | 见下。这一项是**独立的一整份文件**（`tests/test_e2e.py`），不与上面各组的用例重叠 |
+| **合计** | **290** | |
 
 > 计数含 `@pytest.mark.parametrize` 展开后的用例数，与 `pytest --collect-only` 一致。
 
@@ -347,7 +356,7 @@ JSON 很严格，手工加规则时漏一个逗号就会解析失败，而 MCDR 
 python tools/mutation_check.py
 ```
 
-脚本会依次注入 46 个缺陷，要求相关用例变红；全绿即视为测试失效。
+脚本会依次注入 51 个缺陷，要求相关用例变红；全绿即视为测试失效。
 
 > **判定看 pytest 的退出码：只有 `exit == 1` 才算「被抓住」。** `4`（命令行用法错误）
 > 和 `5`（没收集到用例）都说明**脚本自己写错了**，不是测试变红——早期把 `4` 也当命中，
@@ -402,6 +411,11 @@ python tools/mutation_check.py
 | **规则编号永远补到两位**（9 条以内出现 `[ 1]`） | `test_a_single_digit_rule_index_has_no_padding` |
 | **打包时又把注释发出去** | `test_the_packaged_code_carries_no_comments_or_docstrings` |
 | **剥注释时删行导致行号错位** | `test_stripping_keeps_line_numbers_so_tracebacks_still_match` |
+| **命令重载把计数清零** | `test_the_reload_command_does_not_fake_an_idle_session`、`test_a_reload_keeps_the_counts_of_rules_that_survive` |
+| **`test` 又只报第一条命中规则** | `test_the_test_command_lists_every_matching_rule` |
+| **去掉「匹配一切」守卫** | `test_a_pattern_that_hides_everything_is_flagged`（7 条参数化）、`test_a_catch_all_rule_is_kept_but_warned` |
+| **去掉重复规则的去重** | `test_the_same_rule_written_twice_becomes_one`、`test_a_duplicate_is_reported_and_does_not_poison_the_statistics` |
+| **zip 时间戳跟着文件 mtime**（包不再可复现） | `test_packing_the_same_source_twice_gives_identical_bytes`、`test_every_member_carries_the_pinned_timestamp` |
 | **编译异常只接 `re.error`**（量化符溢出/深层嵌套又变致命） | `test_a_pattern_that_overflows_is_skipped_not_fatal`、`test_a_deeply_nested_pattern_is_skipped_not_fatal` |
 | **格式化异常只接三种**（`{a.b}` 又会让消息路径抛异常） | `test_a_template_with_a_bad_attribute_is_returned_raw` |
 
