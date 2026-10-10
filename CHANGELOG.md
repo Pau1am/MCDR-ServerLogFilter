@@ -5,7 +5,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
 **本文件只保留最新一个版本的条目**，更早版本的记录见
-[GitHub Releases](https://github.com/Pau1am/MCDR-ServerLogFilter/releases)。
+[GitHub Releases](https://github.com/LifeSci-Craft/MCDR-ServerLogFilter/releases)。
 
 ---
 
